@@ -1,0 +1,67 @@
+include:
+  - local: /.gitlab/security-ci.yml
+  - local: /.gitlab/secret-ci.yml
+  - local: /.gitlab/linter-ci.yml
+  - local: /.gitlab/type-checker-ci.yml
+  - local: /.gitlab/unit-tests-ci.yml
+  - local: /.gitlab/tag-ci.yml
+  - local: /.gitlab/publish-ci.yml
+stages:
+  - test
+  - release
+  - publish
+security:
+  extends: .security
+secret:
+  extends: .secret
+
+.python_versions: &python_versions
+  - '3.8'
+  - '3.9'
+  - '3.10'
+  - '3.11'
+  - '3.12'
+  - '3.13'
+
+# https://docs.gitlab.com/ci/yaml/#parallelmatrix
+linter:
+  extends: .linter
+  image:
+    name: python:$PY_VERSION
+  parallel:
+    matrix:
+      - PY_VERSION: *python_versions
+
+type_checker:
+  extends: .type_checker
+  image:
+    name: python:$PY_VERSION
+  parallel:
+    matrix:
+      - PY_VERSION: *python_versions
+
+unit_tests:
+  extends: .unit_tests
+  image:
+    name: python:$PY_VERSION
+  parallel:
+    matrix:
+      - PY_VERSION: *python_versions
+
+.tag_base:
+  extends: .tag
+  needs:
+    - security
+    - secret
+    - linter
+    - type_checker
+    - unit_tests
+tag:major:
+  extends: .tag_base
+tag:minor:
+  extends: .tag_base
+tag:patch:
+  extends: .tag_base
+
+publish:
+  extends: .publish

@@ -1,0 +1,117 @@
+[tool.poetry]
+name = "django-oauth2-codeflow"
+version = "1.0.0"
+description = "Authenticate with any OpenId Connect/Oauth2 provider through authorization code flow. PKCE is also supported."
+authors = ["Melih Sünbül <m.sunbul@excellence-cloud.com>"]
+maintainers = ["Melih Sünbül <m.sunbul@excellence-cloud.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ExcellenceCloudGmbH/django-oauth2-codeflow"
+documentation = "https://github.com/ExcellenceCloudGmbH/django-oauth2-codeflow/blob/master/README.md"
+keywords = ["oauth2", "oidc", "openid"]
+# https://pypi.org/classifiers/
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Environment :: Web Environment",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: Django",
+    "Framework :: Django :: 4.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Framework :: Django :: 5.2",
+    "Topic :: Internet :: WWW/HTTP :: Session",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+packages = [{include = "oauth2_authcodeflow"}]
+include = ["CHANGELOG.md", "OP.md"]
+
+[tool.poetry.urls]
+# https://github.com/pypi/warehouse/blob/main/warehouse/templates/packaging/detail.html#L20
+"Bug Tracker" = "https://github.com/ExcellenceCloudGmbH/django-oauth2-codeflow/issues"
+"Changelog" = "https://github.com/ExcellenceCloudGmbH/django-oauth2-codeflow/blob/master/CHANGELOG.md"
+"Contributing" = "https://github.com/ExcellenceCloudGmbH/django-oauth2-codeflow/blob/master/CONTRIBUTING.md"
+# Any Github url will be used for stats
+"Github mirror" = "https://github.com/ExcellenceCloudGmbH/django-oauth2-codeflow"
+
+[tool.poetry.dependencies]
+# https://docs.djangoproject.com/en/dev/faq/install/#faq-python-version-support
+python = "^3.8"
+django = ">=4.2"
+python-jose = {extras = ["cryptography"], version = ">=3.3"}
+requests = ">=2.28"
+
+[tool.poetry.group.dev.dependencies]
+flake8 = "*"
+flake8-pyproject = "*"
+freezegun = "*"
+isort = "*"
+pdbpp = "*"
+pytest = "*"
+pytest-cov = "*"
+pytest-django = "*"
+pytest-html = "*"
+
+[tool.poetry.group.typing.dependencies]
+django-types = "*"
+mypy = "*"
+types-cryptography = "*"
+types-python-jose = "*"
+types-requests = "*"
+
+[tool.flake8]
+max-line-length = 160
+exclude = [".venv", "venv"]
+
+[tool.pytest.ini_options]
+django_find_project = "false" # do not rely on manage.py file presence
+pythonpath = "." # indicate the root path
+django_debug_mode = "keep" # respect debug mode in test settings
+DJANGO_SETTINGS_MODULE = "test.settings"
+junit_family = "xunit2"
+junit_logging = "all"
+addopts = [
+    "--color=auto",
+    "--code-highlight=yes",
+    "--junit-xml=reports/report.xunit",
+    "--html=reports/report.html",
+    "--self-contained-html",
+    "--cov",
+    "--cov-report=term",
+    "--cov-report=xml",
+    "--cov-report=html",
+]
+[tool.coverage.run]
+source = ["oauth2_authcodeflow"]
+omit = ["tests/*", "*/migrations/*", "*/__init__.py"]
+branch = true
+relative_files = true
+[tool.coverage.report]
+precision = 2
+[tool.coverage.xml]
+output = "reports/coverage.xml"
+[tool.coverage.html]
+directory = "reports/coverage"
+title = "Django OAuth2 Auth Code Flow coverage"
+
+[[tool.poetry.source]]
+name = "PyPI"
+priority = "primary"
+
+[[tool.poetry.source]]
+name = "testPyPI"
+url = "https://test.pypi.org/legacy/"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
