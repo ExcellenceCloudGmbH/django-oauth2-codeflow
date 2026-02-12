@@ -40,6 +40,7 @@ from .models import BlacklistedToken
 import time
 from django.core.cache import caches
 import os
+import random
 
 logger = getLogger(__name__)
 
@@ -223,19 +224,21 @@ class LoginRequiredMiddleware(Oauth2MiddlewareMixin):
 
 
 class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
-    REFRESH_LOCK_TTL = 20
-    REFRESH_WAIT_SECONDS = 5
-    REFRESH_WAIT_STEP = 0.2
-    """
-    Refreshes the access token with the OIDC RP after expiry seconds
-    For users authenticated with the OIDC RP, verify tokens are still valid and
-    if not, force the user to refresh silently.
-    """
-    def __init__(self, get_response: GetResponseCallable) -> None:
-        super().__init__(get_response, 'access_token', self.check_access_token)
+    # Refresh slightly before expiry to avoid stampede
+    TOKEN_SKEW_SECONDS = 30
+
+    # Network timeout to token endpoint
+    REFRESH_HTTP_TIMEOUT = 10
+
+    # Lock settings
+    REFRESH_LOCK_TTL = 60  # must be > REFRESH_HTTP_TIMEOUT, ideally 3-6x
+    REFRESH_WAIT_SECONDS = 65  # TTL + buffer
+
+    # Backoff settings for followers
+    BASE_SLEEP = 0.05
+    MAX_SLEEP = 0.8
 
     def _reload_session_from_store(self, request):
-        # Re-load session from backend storage (DB session engine)
         SessionStore = request.session.__class__
         fresh = SessionStore(session_key=request.session.session_key)
         fresh.load()
@@ -244,9 +247,56 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
                 constants.SESSION_ACCESS_TOKEN,
                 constants.SESSION_ACCESS_EXPIRES_AT,
                 constants.SESSION_REFRESH_TOKEN,
+                constants.SESSION_EXPIRES_AT,
         ):
             if k in fresh:
                 request.session[k] = fresh[k]
+
+    def _is_access_valid(self, request) -> bool:
+        exp = request.session.get(constants.SESSION_ACCESS_EXPIRES_AT)
+        if not exp:
+            return False
+        now = int(datetime.now(tz=timezone.utc).timestamp())
+        return exp > (now + self.TOKEN_SKEW_SECONDS)
+
+    def _do_refresh_as_leader(self, request):
+        now = int(datetime.now(tz=timezone.utc).timestamp())
+
+        params = {
+            "grant_type": "refresh_token",
+            "client_id": settings.OIDC_RP_CLIENT_ID,
+            "refresh_token": request.session[constants.SESSION_REFRESH_TOKEN],
+        }
+        if not settings.OIDC_RP_USE_PKCE or settings.OIDC_RP_FORCE_SECRET_WITH_PKCE:
+            params["client_secret"] = settings.OIDC_RP_CLIENT_SECRET or ""
+
+        resp = request_post(
+            request.session[constants.SESSION_OP_TOKEN_URL],
+            data=params,
+            timeout=self.REFRESH_HTTP_TIMEOUT,
+        )
+
+        if resp.status_code != 200:
+            # Important: another request may already have refreshed in parallel (rotation race)
+            self._reload_session_from_store(request)
+            if self._is_access_valid(request):
+                return
+            raise MiddlewareException(resp.text)
+
+        result = resp.json()
+        access_token = result["access_token"]
+        expires_in = int(result["expires_in"])
+        id_token = result.get("id_token", request.session.get(constants.SESSION_ID_TOKEN))
+        refresh_token = result.get("refresh_token", request.session[constants.SESSION_REFRESH_TOKEN])
+
+        if id_token and id_token != request.session.get(constants.SESSION_ID_TOKEN):
+            BlacklistedToken.blacklist(request.session[constants.SESSION_ID_TOKEN])
+
+        request.session[constants.SESSION_ID_TOKEN] = id_token
+        request.session[constants.SESSION_ACCESS_TOKEN] = access_token
+        request.session[constants.SESSION_ACCESS_EXPIRES_AT] = now + expires_in
+        request.session[constants.SESSION_REFRESH_TOKEN] = refresh_token
+        request.session.save()
 
     def check_access_token(self, request):
         if not self.is_refreshable_url(request):
@@ -254,92 +304,59 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
         if constants.SESSION_REFRESH_TOKEN not in request.session:
             return
 
-        utc_expiration = request.session[constants.SESSION_ACCESS_EXPIRES_AT]
-        utc_now = int(datetime.now(tz=timezone.utc).timestamp())
-        if utc_expiration > utc_now:
-            # The id_token is still valid, so we don't have to do anything.
-            logger.debug(
-                'access token is still valid (%s > %s)',
-                datetime.fromtimestamp(utc_expiration).strftime('%d/%m/%Y, %H:%M:%S'),
-                datetime.fromtimestamp(utc_now).strftime('%d/%m/%Y, %H:%M:%S'),
-            )
+        # fast path
+        if self._is_access_valid(request):
             return
-        logger.debug('access token has expired')
 
-        # --- Single-flight lock (prevents concurrent refresh storms) ---
-        lock_cache = caches["redis" if os.getenv("DEPLOYMENT_ENVIRONMENT") else "local"]  # you have it
-        lock_key = f"oidc:refresh:{request.session.session_key}"
-        got_lock = lock_cache.add(lock_key, "1", timeout=self.REFRESH_LOCK_TTL)
+        # ensure session key exists
+        if not request.session.session_key:
+            request.session.save()
+        session_key = request.session.session_key
 
-        if not got_lock:
-            # Someone else is refreshing. Wait briefly, then reload session and continue.
-            deadline = time.monotonic() + self.REFRESH_WAIT_SECONDS
-            while time.monotonic() < deadline:
-                time.sleep(self.REFRESH_WAIT_STEP)
-                self._reload_session_from_store(request)
-                utc_expiration = request.session.get(constants.SESSION_ACCESS_EXPIRES_AT, 0)
-                utc_now = int(datetime.now(tz=timezone.utc).timestamp())
-                if utc_expiration > utc_now:
-                    return
-            # still expired -> fall through and attempt refresh anyway (or raise)
-            # I prefer attempt refresh once after wait:
-            got_lock = lock_cache.add(lock_key, "1", timeout=self.REFRESH_LOCK_TTL)
+        # use dedicated lock cache if you add it, else "redis"
+        lock_cache = "redis" if os.getenv("DEPLOYMENT_ENVIRONMENT") else "local"
 
-        try:
-            # Re-check after acquiring lock (another request may have refreshed)
+        lock_key = f"oidc:refresh_lock:{session_key}"
+
+        # "token" is not used for CAS delete here (we rely on TTL),
+        # but can be useful for debugging.
+        token = f"{random.randint(1, 10 ** 9)}"
+
+        # Try to become leader
+        if lock_cache.add(lock_key, token, timeout=self.REFRESH_LOCK_TTL):
+            # leader
             self._reload_session_from_store(request)
-            utc_expiration = request.session.get(constants.SESSION_ACCESS_EXPIRES_AT, 0)
-            utc_now = int(datetime.now(tz=timezone.utc).timestamp())
-            if utc_expiration > utc_now:
+            if self._is_access_valid(request):
                 return
 
-            params = {
-                "grant_type": "refresh_token",
-                "client_id": settings.OIDC_RP_CLIENT_ID,
-                "refresh_token": request.session[constants.SESSION_REFRESH_TOKEN],
-            }
-            if not settings.OIDC_RP_USE_PKCE or settings.OIDC_RP_FORCE_SECRET_WITH_PKCE:
-                params["client_secret"] = settings.OIDC_RP_CLIENT_SECRET or ""
+            self._do_refresh_as_leader(request)
 
-            resp = request_post(
-                request.session[constants.SESSION_OP_TOKEN_URL],
-                data=params,
-                timeout=10,  # add timeout to avoid hanging requests
-            )
+            # DO NOT delete lock (safe). Let TTL expire naturally.
+            return
 
-            if resp.status_code != 200:
-                # Key part: don't instantly destroy session if another request rotated token.
-                # Reload once and see if tokens are now fresh.
-                self._reload_session_from_store(request)
-                utc_expiration = request.session.get(constants.SESSION_ACCESS_EXPIRES_AT, 0)
-                utc_now = int(datetime.now(tz=timezone.utc).timestamp())
-                if utc_expiration > utc_now:
+        # follower: wait for leader to finish (or lock TTL to expire)
+        deadline = time.monotonic() + self.REFRESH_WAIT_SECONDS
+        sleep = self.BASE_SLEEP
+
+        while time.monotonic() < deadline:
+            time.sleep(sleep + random.uniform(0, sleep * 0.3))  # jitter
+            self._reload_session_from_store(request)
+
+            if self._is_access_valid(request):
+                return
+
+            # If lock expired (leader died), try to take over
+            if lock_cache.get(lock_key) is None:
+                if lock_cache.add(lock_key, token, timeout=self.REFRESH_LOCK_TTL):
+                    self._reload_session_from_store(request)
+                    if self._is_access_valid(request):
+                        return
+                    self._do_refresh_as_leader(request)
                     return
-                raise MiddlewareException(resp.text)
 
-            result = resp.json()
-            access_token = result["access_token"]
-            expires_in = result["expires_in"]
-            id_token = result.get("id_token", request.session[constants.SESSION_ID_TOKEN])
-            refresh_token = result.get("refresh_token", request.session[constants.SESSION_REFRESH_TOKEN])
+            sleep = min(self.MAX_SLEEP, sleep * 1.6)
 
-            if id_token != request.session[constants.SESSION_ID_TOKEN]:
-                BlacklistedToken.blacklist(request.session[constants.SESSION_ID_TOKEN])
-
-            request.session[constants.SESSION_ID_TOKEN] = id_token
-            request.session[constants.SESSION_ACCESS_TOKEN] = access_token
-            request.session[constants.SESSION_ACCESS_EXPIRES_AT] = utc_now + expires_in
-            request.session[constants.SESSION_REFRESH_TOKEN] = refresh_token
-            request.session.save()
-
-        finally:
-            # release lock best-effort
-            try:
-                lock_cache.delete(lock_key)
-            except Exception:
-                pass
-
-
+        raise MiddlewareException("Token refresh did not complete in time")
 class RefreshSessionMiddleware(Oauth2MiddlewareMixin):
     """
     Checks if the session expired.
