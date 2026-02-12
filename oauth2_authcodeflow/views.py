@@ -366,7 +366,7 @@ class TotalLogoutView(LogoutView, UrlParamsMixin):
         if settings.OIDC_OP_TOTAL_LOGOUT and end_session_url:
             state = get_random_string(settings.OIDC_RANDOM_SIZE)
             logout_params = {
-                'id_token_hint': id_token or '',
+                'client_id': settings.OIDC_RP_CLIENT_ID,
                 'post_logout_redirect_uri': request.build_absolute_uri(reverse(constants.OIDC_URL_CALLBACK_NAME)),
                 'state': state,
             }

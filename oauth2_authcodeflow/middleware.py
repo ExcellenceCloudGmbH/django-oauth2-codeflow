@@ -76,6 +76,10 @@ class Oauth2MiddlewareMixin:
         ) + tuple(str(p) for p in settings.OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS)
         logger.debug(f"{self.exempt_urls=}")
 
+        self.refresh_exempt_urls = oidc_endpoints + tuple(
+            str(p) for p in getattr(settings, "OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS", ())
+        )
+
     def __call__(self, request: HttpRequest) -> HttpResponse:
         response = self.process_request(request)
         return response or self.get_response(request)
@@ -88,6 +92,9 @@ class Oauth2MiddlewareMixin:
             auth_backend = import_string(backend_session)
         return issubclass(auth_backend, AuthenticationBackend) if auth_backend else False
 
+    def is_refresh_exempt(self, request) -> bool:
+        return any(search(p, request.path) for p in self.refresh_exempt_urls)
+
     def is_refreshable_url(self, request: HttpRequest) -> bool:
         """
         Takes a request and returns whether it triggers a refresh examination
@@ -97,13 +104,10 @@ class Oauth2MiddlewareMixin:
         # Do not attempt to refresh the session if the OIDC backend is not used
         is_oidc_enabled = self.is_oidc_enabled(request)
         logger.debug(f"{is_oidc_enabled=}, {request.path=}, {self.exempt_urls=}")
-        if is_oidc_enabled:
-            for url_pattern in self.exempt_urls:
-                if search(url_pattern, request.path):
-                    return False
-            return True
-        else:
+        if not is_oidc_enabled:
             return False
+        # IMPORTANT: only skip refresh for refresh_exempt_urls (not login_exempt_urls)
+        return not self.is_refresh_exempt(request)
 
     def check_blacklisted(self, request: HttpRequest) -> None:
         logger.debug(f"{self=}, {request.session.session_key=}, {request.session.keys()=}")
