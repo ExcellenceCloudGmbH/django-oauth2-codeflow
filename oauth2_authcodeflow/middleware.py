@@ -114,13 +114,44 @@ class Oauth2MiddlewareMixin:
         # IMPORTANT: only skip refresh for refresh_exempt_urls (not login_exempt_urls)
         return not self.is_refresh_exempt(request)
 
-    def check_blacklisted(self, request: HttpRequest) -> None:
-        logger.debug(f"{self=}, {request.session.session_key=}, {request.session.keys()=}")
-        if constants.SESSION_ID_TOKEN in request.session:
-            id_token = request.session[constants.SESSION_ID_TOKEN]
-            if BlacklistedToken.is_blacklisted(id_token):
-                logger.debug(f"token {id_token} is blacklisted")
-                raise MiddlewareException(f"token {id_token} is blacklisted")
+    def _reload_session_from_store(self, request):
+        SessionStore = request.session.__class__
+        fresh = SessionStore(session_key=request.session.session_key)
+        fresh.load()
+        # copy relevant keys
+        for k in (
+            constants.SESSION_ID_TOKEN,
+            constants.SESSION_ACCESS_TOKEN,
+            constants.SESSION_ACCESS_EXPIRES_AT,
+            constants.SESSION_REFRESH_TOKEN,
+            constants.SESSION_EXPIRES_AT,
+        ):
+            if k in fresh:
+                request.session[k] = fresh[k]
+
+    def check_blacklisted(self, request):
+        if constants.SESSION_ID_TOKEN not in request.session:
+            return
+
+        tok = request.session.get(constants.SESSION_ID_TOKEN)
+        if not tok:
+            return
+
+        if not BlacklistedToken.is_blacklisted(tok):
+            return
+
+        # Token appears blacklisted — could be stale session snapshot in this request.
+        # Reload once from the session store and re-check.
+        try:
+            self._reload_session_from_store(request)
+            new_tok = request.session.get(constants.SESSION_ID_TOKEN)
+            if new_tok and new_tok != tok and not BlacklistedToken.is_blacklisted(new_tok):
+                return  # session was updated by another request; proceed safely
+        except Exception:
+            # if reload fails, fall back to original behavior
+            pass
+
+        raise MiddlewareException(f"token is blacklisted")
 
     def get_param_url(self, request: HttpRequest, get_field: str, session_field: str) -> str:
         url = request.GET.get(get_field) if request.method == 'GET' else None
@@ -286,17 +317,25 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
         result = resp.json()
         access_token = result["access_token"]
         expires_in = int(result["expires_in"])
-        id_token = result.get("id_token", request.session.get(constants.SESSION_ID_TOKEN))
-        refresh_token = result.get("refresh_token", request.session[constants.SESSION_REFRESH_TOKEN])
 
-        if id_token and id_token != request.session.get(constants.SESSION_ID_TOKEN):
-            BlacklistedToken.blacklist(request.session[constants.SESSION_ID_TOKEN])
+        new_id_token = result.get("id_token", request.session.get(constants.SESSION_ID_TOKEN))
+        new_refresh_token = result.get("refresh_token", request.session.get(constants.SESSION_REFRESH_TOKEN))
 
-        request.session[constants.SESSION_ID_TOKEN] = id_token
+        # 1) Capture the old id_token BEFORE overwriting
+        old_id_token = request.session.get(constants.SESSION_ID_TOKEN)
+
+        # 2) Write the new tokens into session
+        request.session[constants.SESSION_ID_TOKEN] = new_id_token
         request.session[constants.SESSION_ACCESS_TOKEN] = access_token
-        request.session[constants.SESSION_ACCESS_EXPIRES_AT] = now + expires_in
-        request.session[constants.SESSION_REFRESH_TOKEN] = refresh_token
+        request.session[constants.SESSION_ACCESS_EXPIRES_AT] = utc_now + expires_in
+        request.session[constants.SESSION_REFRESH_TOKEN] = new_refresh_token
+
+        # 3) Persist session FIRST (so other concurrent requests can reload and see the new token)
         request.session.save()
+
+        # 4) Only AFTER saving, blacklist the old token (if it actually changed)
+        if old_id_token and new_id_token and new_id_token != old_id_token:
+            BlacklistedToken.blacklist(old_id_token)
 
     def check_access_token(self, request):
         if not self.is_refreshable_url(request):
