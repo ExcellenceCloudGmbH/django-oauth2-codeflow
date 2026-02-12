@@ -257,7 +257,14 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
         utc_expiration = request.session[constants.SESSION_ACCESS_EXPIRES_AT]
         utc_now = int(datetime.now(tz=timezone.utc).timestamp())
         if utc_expiration > utc_now:
+            # The id_token is still valid, so we don't have to do anything.
+            logger.debug(
+                'access token is still valid (%s > %s)',
+                datetime.fromtimestamp(utc_expiration).strftime('%d/%m/%Y, %H:%M:%S'),
+                datetime.fromtimestamp(utc_now).strftime('%d/%m/%Y, %H:%M:%S'),
+            )
             return
+        logger.debug('access token has expired')
 
         # --- Single-flight lock (prevents concurrent refresh storms) ---
         lock_cache = caches["redis" if os.getenv("DEPLOYMENT_ENVIRONMENT") else "local"]  # you have it
