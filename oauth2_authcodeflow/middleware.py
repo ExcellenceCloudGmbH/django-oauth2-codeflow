@@ -64,7 +64,7 @@ class Oauth2MiddlewareMixin:
     check_function: Optional[CheckFunctionCallable]
     exempt_urls: Tuple[str, ...]
 
-    def __init__(self, get_response: GetResponseCallable, token_type: Optional[str], check_function: Optional[CheckFunctionCallable]) -> None:
+    def __init__(self, get_response: GetResponseCallable, token_type: Optional[str] = None, check_function: Optional[CheckFunctionCallable] = None) -> None:
         oidc_endpoints = tuple(
             f'^{reverse(url)}' for url in (
                 constants.OIDC_URL_AUTHENTICATION_NAME,
