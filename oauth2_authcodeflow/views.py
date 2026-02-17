@@ -370,12 +370,17 @@ class TotalLogoutView(LogoutView, UrlParamsMixin):
                 'post_logout_redirect_uri': request.build_absolute_uri(reverse(constants.OIDC_URL_CALLBACK_NAME)),
                 'state': state,
             }
+            if id_token:
+                logout_params['id_token_hint'] = id_token
             self._clear_cache(request)
             request.session[constants.SESSION_NEXT_URL] = next_url
             request.session[constants.SESSION_FAIL_URL] = failure_url
             # id token needs to go back into session because the OP may call the LogoutByOPView on logout
             # and LogoutByOPView needs the id token
-            request.session[constants.SESSION_ID_TOKEN] = id_token
+            if id_token:
+                request.session[constants.SESSION_ID_TOKEN] = id_token
+            else:
+                request.session.pop(constants.SESSION_ID_TOKEN, None)
             request.session[constants.SESSION_LOGOUT_STATE] = state
             request.session.save()
             redirect_url = self.get_url_with_params(end_session_url, **logout_params)

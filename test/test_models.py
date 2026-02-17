@@ -62,6 +62,20 @@ def test_is_blacklisted(db, frozen_datetime, settings_email_as_username):
     assert BlacklistedToken.is_blacklisted(token) is True
 
 
+def test_is_blacklisted_with_none_token(db, settings_email_as_username):
+    assert BlacklistedToken.is_blacklisted(None) is False
+
+
+def test_blacklist_with_none_token(db, settings_email_as_username):
+    assert BlacklistedToken.blacklist(None) is None
+    assert BlacklistedToken.objects.count() == 0
+
+
+def test_is_blacklisted_with_invalid_token(db, settings_email_as_username):
+    assert BlacklistedToken.is_blacklisted('not-a-jwt') is False
+    assert BlacklistedToken.objects.count() == 0
+
+
 def test_purge(db, frozen_datetime, settings_email_as_username):
     exp_date = frozen_datetime() - timedelta(minutes=5)
     token1 = jwt.encode({'email': 'my-email@example.com'}, '')

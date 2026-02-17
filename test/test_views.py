@@ -843,6 +843,7 @@ class TestTotalLogoutView:
     def test_logout(self, BlacklistedToken, get_random_string, clear_cache, get_url_with_params, super_logout, db, rf, sf, settings):
         view = TotalLogoutView()
         settings.OIDC_OP_TOTAL_LOGOUT = True
+        settings.OIDC_RP_CLIENT_ID = 'client-id'
         settings.OIDC_RANDOM_SIZE = 5
         get_random_string.return_value = 'abcde'
         get_url_with_params.return_value = '/callback'
@@ -868,11 +869,40 @@ class TestTotalLogoutView:
         clear_cache.assert_called_once_with(request)
         get_url_with_params.assert_called_once_with(
             '/end/session/url',
+            client_id='client-id',
             id_token_hint='id.token',
             post_logout_redirect_uri='http://testserver/oidc/callback',
             state='abcde',
         )
         assert request.session.session_key is not None
+
+    @patch('oauth2_authcodeflow.views.TotalLogoutView.get_url_with_params')
+    @patch('oauth2_authcodeflow.views.TotalLogoutView._clear_cache')
+    @patch('oauth2_authcodeflow.views.get_random_string')
+    @patch('oauth2_authcodeflow.views.BlacklistedToken')
+    def test_logout_without_id_token(self, BlacklistedToken, get_random_string, clear_cache, get_url_with_params, db, rf, sf, settings):
+        view = TotalLogoutView()
+        settings.OIDC_OP_TOTAL_LOGOUT = True
+        settings.OIDC_RANDOM_SIZE = 5
+        settings.OIDC_RP_CLIENT_ID = 'client-id'
+        get_random_string.return_value = 'abcde'
+        get_url_with_params.return_value = '/callback'
+        request = rf.get('/')
+        session = sf(request)
+        session[constants.SESSION_OP_END_SESSION_URL] = '/end/session/url'
+        session[constants.SESSION_ID_TOKEN] = 'stale.token'
+        response = view.logout(request, None, '/next', '/fail')
+        assert response.status_code == 302
+        assert response.headers['Location'] == '/callback'
+        BlacklistedToken.blacklist.assert_not_called()
+        clear_cache.assert_called_once_with(request)
+        get_url_with_params.assert_called_once_with(
+            '/end/session/url',
+            client_id='client-id',
+            post_logout_redirect_uri='http://testserver/oidc/callback',
+            state='abcde',
+        )
+        assert constants.SESSION_ID_TOKEN not in request.session
 
 
 class TestLogoutByOPView:

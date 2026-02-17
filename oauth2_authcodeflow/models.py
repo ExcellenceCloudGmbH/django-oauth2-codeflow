@@ -15,6 +15,7 @@ from django.db import models
 from django.db.utils import DatabaseError
 from django.utils.functional import cached_property
 from jose import jwt
+from jose.exceptions import JWTError
 
 from .conf import settings
 
@@ -37,8 +38,20 @@ class BlacklistedToken(models.Model):
         ]
 
     @classmethod
-    def blacklist(cls, token: str) -> Optional['BlacklistedToken']:
-        claims = jwt.get_unverified_claims(token)
+    def _get_claims(cls, token: Optional[str]) -> Optional[dict]:
+        if not token:
+            return None
+        try:
+            return jwt.get_unverified_claims(token)
+        except JWTError as e:
+            logger.debug("cannot decode token claims for blacklist operation: %s", str(e))
+            return None
+
+    @classmethod
+    def blacklist(cls, token: Optional[str]) -> Optional['BlacklistedToken']:
+        claims = cls._get_claims(token)
+        if not claims or not token:
+            return None
         username = settings.OIDC_DJANGO_USERNAME_FUNC(claims)
         now = datetime.now(tz=timezone.utc)
         if 'exp' in claims:
@@ -52,10 +65,12 @@ class BlacklistedToken(models.Model):
             return None
 
     @classmethod
-    def is_blacklisted(cls, token: str) -> bool:
-        claims = jwt.get_unverified_claims(token)
+    def is_blacklisted(cls, token: Optional[str]) -> bool:
+        claims = cls._get_claims(token)
+        if not claims or not token:
+            return False
         username = settings.OIDC_DJANGO_USERNAME_FUNC(claims)
-        return cls.objects.filter(username=username, token=token).count() > 0
+        return cls.objects.filter(username=username, token=token).exists()
 
     @classmethod
     def purge(cls) -> int:

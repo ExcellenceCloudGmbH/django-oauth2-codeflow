@@ -123,8 +123,13 @@ class TestOauth2MiddlewareMixin:
         request = rf.get('/oidc/authenticate')
         session = sf(request)
         mixin.check_blacklisted(request)
+        BlacklistedToken.is_blacklisted.assert_not_called()
+        session[constants.SESSION_ID_TOKEN] = None
+        mixin.check_blacklisted(request)
+        BlacklistedToken.is_blacklisted.assert_not_called()
         session[constants.SESSION_ID_TOKEN] = 'abc123'
         mixin.check_blacklisted(request)
+        BlacklistedToken.is_blacklisted.assert_called_once_with('abc123')
         BlacklistedToken.is_blacklisted.return_value = True
         with pytest.raises(MiddlewareException, match=escape("token abc123 is blacklisted")):
             mixin.check_blacklisted(request)
@@ -306,6 +311,19 @@ class TestLoginRequiredMiddleware:
         with pytest.raises(MiddlewareException, match=escape("some error")):
             middleware.check_login_required(request)
 
+    @patch('oauth2_authcodeflow.middleware.authenticate')
+    @patch('oauth2_authcodeflow.middleware.LoginRequiredMiddleware.is_login_required_for_url')
+    def test_check_login_required_with_none_id_token(self, is_login_required_for_url, authenticate, rf, sf):
+        is_login_required_for_url.return_value = True
+        request = rf.get('/')
+        session = sf(request)
+        session[constants.SESSION_ID_TOKEN] = None
+        middleware = LoginRequiredMiddleware(MagicMock())
+        authenticate.return_value = None
+        with pytest.raises(MiddlewareException, match=escape("id token is missing, user is not authenticated")):
+            middleware.check_login_required(request)
+        authenticate.assert_called_once_with(request)
+
 
 class TestRefreshAccessTokenMiddleware:
     def test_init(self):
@@ -327,6 +345,7 @@ class TestRefreshAccessTokenMiddleware:
             'access_token': '456789',
             'expires_in': 120,
         }
+        request_post.return_value.status_code = 200
         request_post.return_value.text = "some error"
         # case not refreshable url
         is_refreshable_url.return_value = False
@@ -375,7 +394,7 @@ class TestRefreshAccessTokenMiddleware:
             client_id=settings.OIDC_RP_CLIENT_ID,
             client_secret=settings.OIDC_RP_CLIENT_SECRET,
             refresh_token='13579',
-        ))
+        ), timeout=10)
         BlacklistedToken.blacklist.assert_not_called()
         # case expired, different id token
         # without client secret
@@ -398,14 +417,14 @@ class TestRefreshAccessTokenMiddleware:
             grant_type='refresh_token',
             client_id=settings.OIDC_RP_CLIENT_ID,
             refresh_token='13579',
-        ))
+        ), timeout=10)
         BlacklistedToken.blacklist.assert_called_once_with('abc123')
         # case refresh is denied by OP
         # not using PKCE nor client secret
         settings.OIDC_RP_USE_PKCE = False
         settings.OIDC_RP_CLIENT_SECRET = None
         request_post.reset_mock()
-        request_post.return_value.__bool__.return_value = False
+        request_post.return_value.status_code = 400
         session = sf(request)
         session[constants.SESSION_ID_TOKEN] = 'abc123'
         session[constants.SESSION_REFRESH_TOKEN] = '13579'
@@ -419,7 +438,7 @@ class TestRefreshAccessTokenMiddleware:
             client_id=settings.OIDC_RP_CLIENT_ID,
             client_secret='',
             refresh_token='13579',
-        ))
+        ), timeout=10)
 
 
 class TestRefreshSessionMiddleware:

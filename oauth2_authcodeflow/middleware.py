@@ -17,6 +17,7 @@ from django.contrib.auth import (
     authenticate,
 )
 from django.contrib.sessions.models import Session
+from django.core.cache.backends.base import InvalidCacheBackendError
 from django.core.exceptions import ImproperlyConfigured
 from django.http import (
     HttpResponseRedirect,
@@ -80,9 +81,8 @@ class Oauth2MiddlewareMixin:
         self.exempt_urls = oidc_endpoints + tuple(str(p) for p in settings.OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS)
         logger.debug(f"{self.exempt_urls=}")
 
-        self.refresh_exempt_urls = oidc_endpoints + tuple(
-            str(p) for p in getattr(settings, "OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS", ())
-        )
+        refresh_exempt_patterns = getattr(settings, "OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS", None) or ()
+        self.refresh_exempt_urls = oidc_endpoints + tuple(str(p) for p in refresh_exempt_patterns)
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
         response = self.process_request(request)
@@ -115,11 +115,12 @@ class Oauth2MiddlewareMixin:
 
     def check_blacklisted(self, request: HttpRequest) -> None:
         logger.debug(f"{self=}, {request.session.session_key=}, {request.session.keys()=}")
-        if constants.SESSION_ID_TOKEN in request.session:
-            id_token = request.session[constants.SESSION_ID_TOKEN]
-            if BlacklistedToken.is_blacklisted(id_token):
-                logger.debug(f"token {id_token} is blacklisted")
-                raise MiddlewareException(f"token {id_token} is blacklisted")
+        id_token = request.session.get(constants.SESSION_ID_TOKEN)
+        if not id_token:
+            return
+        if BlacklistedToken.is_blacklisted(id_token):
+            logger.debug(f"token {id_token} is blacklisted")
+            raise MiddlewareException(f"token {id_token} is blacklisted")
 
     def get_param_url(self, request: HttpRequest, get_field: str, session_field: str) -> str:
         url = request.GET.get(get_field) if request.method == 'GET' else None
@@ -211,7 +212,7 @@ class LoginRequiredMiddleware(Oauth2MiddlewareMixin):
             logger.debug(f"{request.path} does not need authenticated user")
             return
         logger.debug(f"{request.path} needs an authenticated user")
-        if constants.SESSION_ID_TOKEN not in request.session:
+        if not request.session.get(constants.SESSION_ID_TOKEN):
             try:
                 user = authenticate(request)
             except Exception as e:
@@ -267,7 +268,11 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
         logger.debug('access token has expired')
 
         # --- Single-flight lock (prevents concurrent refresh storms) ---
-        lock_cache = caches["redis" if os.getenv("DEPLOYMENT_ENVIRONMENT") else "local"]  # you have it
+        cache_alias = "redis" if os.getenv("DEPLOYMENT_ENVIRONMENT") else "local"
+        try:
+            lock_cache = caches[cache_alias]
+        except InvalidCacheBackendError:
+            lock_cache = caches["default"]
         lock_key = f"oidc:refresh:{request.session.session_key}"
         got_lock = lock_cache.add(lock_key, "1", timeout=self.REFRESH_LOCK_TTL)
 
@@ -320,13 +325,17 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
             result = resp.json()
             access_token = result["access_token"]
             expires_in = result["expires_in"]
-            id_token = result.get("id_token", request.session[constants.SESSION_ID_TOKEN])
-            refresh_token = result.get("refresh_token", request.session[constants.SESSION_REFRESH_TOKEN])
+            current_id_token = request.session.get(constants.SESSION_ID_TOKEN)
+            id_token = result.get("id_token") or current_id_token
+            refresh_token = result.get("refresh_token") or request.session[constants.SESSION_REFRESH_TOKEN]
 
-            if id_token != request.session[constants.SESSION_ID_TOKEN]:
-                BlacklistedToken.blacklist(request.session[constants.SESSION_ID_TOKEN])
+            if current_id_token and id_token and id_token != current_id_token:
+                BlacklistedToken.blacklist(current_id_token)
 
-            request.session[constants.SESSION_ID_TOKEN] = id_token
+            if id_token:
+                request.session[constants.SESSION_ID_TOKEN] = id_token
+            else:
+                request.session.pop(constants.SESSION_ID_TOKEN, None)
             request.session[constants.SESSION_ACCESS_TOKEN] = access_token
             request.session[constants.SESSION_ACCESS_EXPIRES_AT] = utc_now + expires_in
             request.session[constants.SESSION_REFRESH_TOKEN] = refresh_token
@@ -375,7 +384,9 @@ class RefreshSessionMiddleware(Oauth2MiddlewareMixin):
             return
         # The session has expired, an authentication is now required
         # Blacklist the current id token
-        BlacklistedToken.blacklist(request.session[constants.SESSION_ID_TOKEN])
+        id_token = request.session.get(constants.SESSION_ID_TOKEN)
+        if id_token:
+            BlacklistedToken.blacklist(id_token)
         msg = "Session has expired"
         logger.debug(msg)
         raise MiddlewareException(msg)
