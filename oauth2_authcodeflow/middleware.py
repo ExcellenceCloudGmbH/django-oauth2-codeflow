@@ -16,7 +16,6 @@ from django.contrib.auth import (
     BACKEND_SESSION_KEY,
     authenticate,
 )
-from django.contrib.sessions.models import Session
 from django.core.cache.backends.base import InvalidCacheBackendError
 from django.core.exceptions import ImproperlyConfigured
 from django.http import (
@@ -137,10 +136,9 @@ class Oauth2MiddlewareMixin:
         return self.get_param_url(request, settings.OIDC_REDIRECT_ERROR_FIELD_NAME, constants.SESSION_FAIL_URL)
 
     def destroy_session(self, request: HttpRequest) -> None:
-        try:
-            Session.objects.get(session_key=request.session.session_key).delete()
-        except Session.DoesNotExist:
-            pass
+        # Use Django's session API to avoid response-phase SessionInterrupted races
+        # when another request logs out/deletes the same session concurrently.
+        request.session.flush()
 
     def is_api_request(self, request: HttpRequest) -> bool:
         return any(

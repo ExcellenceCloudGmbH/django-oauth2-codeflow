@@ -183,6 +183,25 @@ class TestOauth2MiddlewareMixin:
         session.save()
         mixin.destroy_session(request)
 
+    def test_destroy_session_avoids_sessioninterrupted_on_response_save(self, rf, db, settings):
+        settings.SESSION_SAVE_EVERY_REQUEST = True
+        settings.OIDC_MIDDLEWARE_API_URL_PATTERNS = ['^/api/']
+
+        session_middleware = SessionMiddleware(lambda req: HttpResponse())
+        request = rf.get('/api/some/url')
+        session_middleware.process_request(request)
+        request.session[constants.SESSION_ID_TOKEN] = 'abc123'
+        request.session.save()
+        assert request.session.session_key is not None
+
+        check = MagicMock(side_effect=MiddlewareException("not good"))
+        mixin = Oauth2MiddlewareMixin(MagicMock(return_value=HttpResponse()), 'test', check)
+        response = mixin(request)
+
+        assert response.status_code == 401
+        assert request.session.session_key is None
+        session_middleware.process_response(request, response)
+
     def test_is_api_request(self, rf, sf, settings):
         settings.OIDC_MIDDLEWARE_API_URL_PATTERNS = ['/rest', '/api']
         mixin = Oauth2MiddlewareMixin(MagicMock(), 'test', MagicMock())
