@@ -1,0 +1,1 @@
+- Python 3.8 and 3.9 support (the patched Django, cryptography, urllib3, requests, sqlparse and pytest releases require Python 3.10+)

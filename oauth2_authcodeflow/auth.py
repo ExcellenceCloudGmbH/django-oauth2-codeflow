@@ -12,6 +12,8 @@ from typing import (
     cast,
 )
 
+import jwt
+from cryptography.x509 import load_pem_x509_certificate
 from django.contrib.auth import get_user_model
 from django.contrib.auth.backends import ModelBackend
 from django.contrib.auth.models import (
@@ -21,10 +23,8 @@ from django.contrib.auth.models import (
 from django.core.exceptions import SuspiciousOperation
 from django.http.request import HttpRequest
 from django.urls import reverse
-from jose import (
-    JWTError,
-    jwt,
-)
+from jwt.algorithms import RSAAlgorithm
+from jwt.exceptions import PyJWTError
 from requests import get as request_get
 from requests import post as request_post
 
@@ -60,20 +60,27 @@ class AuthenticationMixin:
         else:
             raise NotImplementedError(f"Algo {algo} cannot be handled by this authentication backend")
         try:
+            if isinstance(key, dict):
+                # JWK from the OP JWKS endpoint
+                key = RSAAlgorithm.from_jwk(key)
+            elif isinstance(key, bytes) and key.startswith(b'-----BEGIN CERTIFICATE-----'):
+                # python-jose accepted a PEM X.509 certificate as OIDC_RP_IDP_SIGN_KEY, PyJWT only accepts keys
+                key = load_pem_x509_certificate(key).public_key()
+            # python-jose only verified the audience when the token has an 'aud' claim (PyJWT would reject the token): keep that behaviour
+            has_aud = 'aud' in jwt.decode(id_token, options={'verify_signature': False})
             claims = jwt.decode(
                 id_token,
                 key,
                 algorithms=settings.OIDC_RP_SIGN_ALGOS_ALLOWED,
                 audience=settings.OIDC_RP_CLIENT_ID,
                 options={
-                    'verify_aud': True,
+                    'verify_aud': has_aud,
                     'verify_iss': False,
                     'verify_sub': False,
                     'verify_iat': False,
-                    'verify_at_hash': False,
                 },
             )
-        except JWTError as e:
+        except PyJWTError as e:
             raise SuspiciousOperation("JWT token verification failed: " + str(e))
         if nonce is not None and claims.get('nonce') != nonce:
             raise SuspiciousOperation("JWT Nonce verification failed")

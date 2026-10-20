@@ -16,8 +16,6 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Environment :: Web Environment",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -45,9 +43,9 @@ include = ["CHANGELOG.md", "OP.md"]
 
 [tool.poetry.dependencies]
 # https://docs.djangoproject.com/en/dev/faq/install/#faq-python-version-support
-python = "^3.8"
+python = "^3.10"
 django = ">=4.2"
-python-jose = {extras = ["cryptography"], version = ">=3.3"}
+pyjwt = {extras = ["crypto"], version = ">=2.15"}
 requests = ">=2.28"
 
 [tool.poetry.group.dev.dependencies]
@@ -65,7 +63,6 @@ pytest-html = "*"
 django-types = "*"
 mypy = "*"
 types-cryptography = "*"
-types-python-jose = "*"
 types-requests = "*"
 
 [tool.flake8]

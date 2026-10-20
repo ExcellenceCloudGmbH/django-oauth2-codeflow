@@ -9,13 +9,13 @@ from typing import (
     cast,
 )
 
+import jwt
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 from django.db.utils import DatabaseError
 from django.utils.functional import cached_property
-from jose import jwt
-from jose.exceptions import JWTError
+from jwt.exceptions import PyJWTError
 
 from .conf import settings
 
@@ -42,8 +42,8 @@ class BlacklistedToken(models.Model):
         if not token:
             return None
         try:
-            return jwt.get_unverified_claims(token)
-        except JWTError as e:
+            return jwt.decode(token, options={'verify_signature': False})
+        except PyJWTError as e:
             logger.debug("cannot decode token claims for blacklist operation: %s", str(e))
             return None
 

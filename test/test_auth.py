@@ -8,15 +8,20 @@ from json import dumps
 from re import escape
 from unittest.mock import patch
 
+import jwt
 import pytest
-from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.hazmat.primitives import (
+    hashes,
+    serialization,
+)
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from django.contrib.auth.backends import ModelBackend
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.core.exceptions import SuspiciousOperation
 from freezegun import freeze_time
-from jose import jwt
-from jose.utils import long_to_base64
+from jwt.utils import to_base64url_uint
 
 from oauth2_authcodeflow import constants
 from oauth2_authcodeflow.auth import (
@@ -62,7 +67,7 @@ class TestAuthenticationMixin:
             )
         settings.OIDC_RP_SIGN_ALGOS_ALLOWED = ['RS256', 'RS512']
         settings.OIDC_RP_CLIENT_ID = 'a_client_id'
-        settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret'
+        settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret_of_at_least_32_bytes'
         rsa_private_pem = rsa.generate_private_key(65537, 2048).private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
@@ -71,16 +76,16 @@ class TestAuthenticationMixin:
         original_claims = {
             'aud': settings.OIDC_RP_CLIENT_ID,
             'email': 'my-email@example.com',
-            'exp': frozen_datetime() + timedelta(minutes=2),
+            'exp': int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp()),  # PyJWT does not convert the datetime in place
             'nonce': 'bépo',
         }
         hs_token = jwt.encode(
-            claims=original_claims,
+            payload=original_claims,
             key=settings.OIDC_RP_CLIENT_SECRET,
             algorithm='HS256',
         )
         rs_token = jwt.encode(
-            claims=original_claims,
+            payload=original_claims,
             key=rsa_private_pem,
             algorithm='RS256',
             headers={'kid': '123'},
@@ -113,7 +118,7 @@ class TestAuthenticationMixin:
         settings.OIDC_RP_SIGN_ALGOS_ALLOWED = ['HS256', 'RS256']
         with pytest.raises(SuspiciousOperation, match=escape("JWT token verification failed")):
             authentication.validate_and_decode_id_token(
-                id_token='.'.join(hs_token.split('.')[:2]) + '.badsign',
+                id_token='.'.join(hs_token.split('.')[:2]) + '.badsignA',  # canonical base64url, PyJWT rejects non-canonical segments
                 nonce=None,
                 jwks={},
             )
@@ -126,16 +131,16 @@ class TestAuthenticationMixin:
 
     def test_validate_and_decode_id_token_get_claims_with_secret(self, frozen_datetime, settings):
         settings.OIDC_RP_CLIENT_ID = 'a_client_id'
-        settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret'
+        settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret_of_at_least_32_bytes'
         authentication = AuthenticationMixin()
         original_claims = {
             'aud': settings.OIDC_RP_CLIENT_ID,
             'email': 'my-email@example.com',
-            'exp': frozen_datetime() + timedelta(minutes=2),
+            'exp': int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp()),
             'nonce': 'bépo',
         }
         token = jwt.encode(
-            claims=original_claims,
+            payload=original_claims,
             key=settings.OIDC_RP_CLIENT_SECRET,
             algorithm='HS256',
         )
@@ -160,10 +165,10 @@ class TestAuthenticationMixin:
         original_claims = {
             'aud': settings.OIDC_RP_CLIENT_ID,
             'email': 'my-email@example.com',
-            'exp': frozen_datetime() + timedelta(minutes=2),
+            'exp': int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp()),
         }
         token = jwt.encode(
-            claims=original_claims,
+            payload=original_claims,
             key=rsa_private_pem,
             algorithm='RS256',
             headers={'kid': '123'},
@@ -175,8 +180,8 @@ class TestAuthenticationMixin:
                 '42': {'kid': '42', 'kty': 'RSA', 'alg': 'RS256', 'use': 'sig'},
                 '123': {
                     'kid': '123', 'kty': 'RSA', 'alg': 'RS256', 'use': 'sig',
-                    'n': long_to_base64(rsa_public_numbers.n),
-                    'e': long_to_base64(rsa_public_numbers.e),
+                    'n': to_base64url_uint(rsa_public_numbers.n).decode('ascii'),
+                    'e': to_base64url_uint(rsa_public_numbers.e).decode('ascii'),
                 },
             },
         )
@@ -200,10 +205,10 @@ class TestAuthenticationMixin:
         original_claims = {
             'aud': settings.OIDC_RP_CLIENT_ID,
             'email': 'my-email@example.com',
-            'exp': frozen_datetime() + timedelta(minutes=2),
+            'exp': int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp()),
         }
         token = jwt.encode(
-            claims=original_claims,
+            payload=original_claims,
             key=rsa_private_pem,
             algorithm='RS256',
             headers={'kid': '123'},
@@ -214,6 +219,44 @@ class TestAuthenticationMixin:
             jwks={},
         )
         assert claims == original_claims
+
+    def test_validate_and_decode_id_token_get_claims_with_settings_certificate(self, frozen_datetime, settings):
+        rsa_private_key = rsa.generate_private_key(65537, 2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'idp')])
+        certificate = x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(
+            rsa_private_key.public_key(),
+        ).serial_number(1).not_valid_before(
+            datetime(2022, 1, 1),
+        ).not_valid_after(
+            datetime(2024, 1, 1),
+        ).sign(rsa_private_key, hashes.SHA256())
+        settings.OIDC_RP_CLIENT_ID = 'a_client_id'
+        settings.OIDC_RP_IDP_SIGN_KEY = certificate.public_bytes(serialization.Encoding.PEM)
+        original_claims = {
+            'aud': settings.OIDC_RP_CLIENT_ID,
+            'email': 'my-email@example.com',
+            'exp': int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp()),
+        }
+        token = jwt.encode(payload=original_claims, key=rsa_private_key, algorithm='RS256')
+        claims = AuthenticationMixin().validate_and_decode_id_token(id_token=token, nonce=None, jwks={})
+        assert claims == original_claims
+
+    def test_validate_and_decode_id_token_audience(self, frozen_datetime, settings):
+        settings.OIDC_RP_CLIENT_ID = 'a_client_id'
+        settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret_of_at_least_32_bytes'
+        authentication = AuthenticationMixin()
+        exp = int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp())
+        # same as python-jose: the audience is only verified when the token has an 'aud' claim
+        token = jwt.encode({'email': 'my-email@example.com', 'exp': exp}, settings.OIDC_RP_CLIENT_SECRET, algorithm='HS256')
+        assert authentication.validate_and_decode_id_token(id_token=token, nonce=None, jwks={}) == {'email': 'my-email@example.com', 'exp': exp}
+        token = jwt.encode({'aud': ['other', 'a_client_id'], 'exp': exp}, settings.OIDC_RP_CLIENT_SECRET, algorithm='HS256')
+        assert authentication.validate_and_decode_id_token(id_token=token, nonce=None, jwks={}) == {'aud': ['other', 'a_client_id'], 'exp': exp}
+        token = jwt.encode({'aud': 'other', 'exp': exp}, settings.OIDC_RP_CLIENT_SECRET, algorithm='HS256')
+        with pytest.raises(SuspiciousOperation, match=escape("JWT token verification failed: Audience doesn't match")):
+            authentication.validate_and_decode_id_token(id_token=token, nonce=None, jwks={})
+        token = jwt.encode({'aud': 'a_client_id', 'exp': exp - 180}, settings.OIDC_RP_CLIENT_SECRET, algorithm='HS256')
+        with pytest.raises(SuspiciousOperation, match=escape("JWT token verification failed: Signature has expired")):
+            authentication.validate_and_decode_id_token(id_token=token, nonce=None, jwks={})
 
     def test_validate_claims(self, settings):
         authentication = AuthenticationMixin()
