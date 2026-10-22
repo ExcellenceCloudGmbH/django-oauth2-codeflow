@@ -12,7 +12,7 @@ from django.http import (
     HttpResponse,
     HttpResponseRedirect,
 )
-from jose.exceptions import JWTError
+from jwt.exceptions import DecodeError
 
 from oauth2_authcodeflow import constants
 from oauth2_authcodeflow.views import (
@@ -379,7 +379,7 @@ class TestCallbackView:
     @patch('oauth2_authcodeflow.views.jwt')
     def test_get_from_cli(self, jwt, rf):
         view = CallbackView()
-        jwt.get_unverified_header.side_effect = JWTError
+        jwt.get_unverified_header.side_effect = DecodeError
         request = rf.get('/')
         assert view.get_from_cli(request) is False
         request = rf.get('/', {'state': 'some.state.sign'})
@@ -394,7 +394,7 @@ class TestCallbackView:
     @patch('oauth2_authcodeflow.views.jwt')
     def test_prepare_session_and_get_state(self, jwt, db, rf, sf, settings):
         view = CallbackView()
-        jwt.decode.side_effect = JWTError
+        jwt.decode.side_effect = DecodeError
         settings.SECRET_KEY = 'django_key'
         request = rf.get('/')
         assert view.prepare_session_and_get_state(request, False) is None
@@ -910,7 +910,7 @@ class TestLogoutByOPView:
     @patch('oauth2_authcodeflow.views.BlacklistedToken')
     def test_get(self, BlacklistedToken, jwt, rf, sf):
         view = LogoutByOPView()
-        jwt.get_unverified_claims.return_value = {
+        jwt.decode.return_value = {
             'sid': 'session.id',
         }
         request = rf.get('/')
