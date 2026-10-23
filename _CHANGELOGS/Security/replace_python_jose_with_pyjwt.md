@@ -1,2 +1,0 @@
-- Replace `python-jose` by `PyJWT[crypto]>=2.15`: `python-jose` <= 3.5.0 (GHSA-3qf3-8w2g-rqmx) and its `ecdsa` dependency (GHSA-wj6h-64fc-37mp) have no fixed release. The ID token validation keeps the previous rules (signature, `exp`, `nbf`, `jti`, `aud` only when present, nonce).
-- Security updates of the locked dependencies (Django 5.2.18, cryptography 50.0.2, urllib3 2.8.0, requests 2.34.2, idna 3.20, sqlparse 0.6.0, Jinja2 3.1.6, Pygments 2.21.0, pytest 9.1.1)

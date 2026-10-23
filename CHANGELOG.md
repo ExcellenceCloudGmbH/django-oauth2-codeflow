@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## 2.0.0
+### Security
+- Replace `python-jose` by `PyJWT[crypto]>=2.15`: `python-jose` <= 3.5.0 (GHSA-3qf3-8w2g-rqmx) and its `ecdsa` dependency (GHSA-wj6h-64fc-37mp) have no fixed release. The ID token validation keeps the previous rules (signature, `exp`, `nbf`, `jti`, `aud` only when present, nonce).
+- Security updates of the locked dependencies (Django 5.2.18, cryptography 50.0.2, urllib3 2.8.0, requests 2.34.2, idna 3.20, sqlparse 0.6.0, Jinja2 3.1.6, Pygments 2.21.0, pytest 9.1.1, certifi 2026.10.19 for GHSA-6q48-6c7w-9gw2)
+### Changed
+- Python 3.13, Django 5.2 compat
+### Removed
+- Python 3.8 and 3.9 support (the patched Django, cryptography, urllib3, requests, sqlparse and pytest releases require Python 3.10+)
+
 ## 1.2.3
 ### Changed
 - Security update for `python-jose` from version `3.3.0` to `3.4.0`
