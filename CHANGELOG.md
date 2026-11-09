@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## 3.0.0
+### Security
+- Tokens are no longer stored in the Django session. They live in an `OIDCSession` row per sign-in, encrypted at rest (Fernet; `OIDC_TOKEN_ENCRYPTION_KEYS`, or keys derived from `SECRET_KEY` and `SECRET_KEY_FALLBACKS`, which stay as decrypt-only fallbacks so explicit keys can be adopted without signing anyone out; `oidc_rotate_keys`).
+- Symmetric (HS\*) and `none` signatures are never accepted. The default algorithms are RS256, PS256 and ES256.
+- Bearer authentication accepts only access tokens (`typ` Bearer), with `iss` and `aud`/`azp` checked. ID tokens are refused.
+- PKCE (S256), `state` and `nonce` on every sign-in. Pending sign-ins are kept per `state` with a TTL. `next` and `fail` are restricted to allowed hosts (400 otherwise).
+- Calls to the provider never send or store cookies, never follow redirects and always time out (`OIDC_HTTP_TIMEOUT`).
+- Logs and responses never contain tokens; JWTs are redacted from logged values.
+### Fixed
+- A provider outage, an HTML error page, a timeout or a configuration error no longer signs users out. Only `invalid_grant` ends a sign-in; everything else answers 503 and keeps it.
+- Concurrent requests no longer race on refresh. The refresh is single-flight across threads and processes (in-process lock plus `SELECT … FOR UPDATE`), and lost updates of rotated tokens are gone. A request whose token is still usable never waits for it, and the requests queued behind a failed refresh get its outcome instead of each calling the provider again. On PostgreSQL the row lock is `FOR NO KEY UPDATE`, so rows that reference a sign-in can be written while it refreshes.
+- Anonymous fetch/XHR requests get 401 JSON instead of a redirect that fails CORS, and they never destroy a pending sign-in.
+- A callback `?error=` (for example after `prompt=none`) no longer signs the current user out. Several tabs can sign in at once.
+- Signing in no longer resets the password of existing users, which signed them out on every other device.
+- Inactive Django users are no longer re-activated at sign-in.
+- JWKS are cached per process and refetched once on an unknown `kid`. Discovery is cached, and a stale copy is used while the provider is down.
+- `OIDC_TIMEOUT`, `OIDC_PROXY` and `OIDC_CREATE_USER` are applied.
+### Changed
+- New middlewares: `OIDCSessionMiddleware` (refresh and sliding session), `LoginRequiredMiddleware`, `BearerAuthMiddleware`. All of them answer with one contract: 302 for navigations, 401 HTML for frames, 401 JSON `not_authenticated`/`session_expired` for API requests, and 503 JSON `auth_unavailable` with `Retry-After`. Every answer is `no-store`.
+- How long a sign-in lasts is decided by the provider's SSO session. The Django session slides with `SESSION_COOKIE_AGE`; `OIDC_SESSION_MAX_AGE_SECONDS` adds an optional cap.
+- `OIDC_UNUSABLE_PASSWORD` defaults to False and is applied to new users only.
+- Settings renamed (old names still work and warn): `OIDC_TIMEOUT` → `OIDC_HTTP_TIMEOUT`, `OIDC_RP_FORCE_SECRET_WITH_PKCE` → `OIDC_RP_CLIENT_AUTH_METHOD`, `OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS` → `OIDC_LOGIN_REQUIRED_EXEMPT_URL_PATTERNS`, `OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS` → `OIDC_SESSION_EXEMPT_URL_PATTERNS`, `OIDC_MIDDLEWARE_API_URL_PATTERNS` → `OIDC_API_URL_PATTERNS`, `OIDC_MIDDLEWARE_LOGIN_REQUIRED_REDIRECT` → `OIDC_NAVIGATION_REDIRECT`.
+- `oidc_urls` prints the redirect, post-logout and back-channel logout URLs. It warns when the host is not in `ALLOWED_HOSTS`.
+- Supported versions: Django 4.2, 5.2 and 6.0; Python 3.10 to 3.13.
+### Added
+- `OIDCSession` model (migration `0006`). A 2.x session moves into a row on its first request (`OIDC_LEGACY_SESSION_MIGRATION`).
+- OpenID Connect Back-Channel Logout 1.0 at `oidc/backchannel-logout`. It validates the `logout_token`, ends sign-ins by `sid` or `sub`, and checks replays per `jti`. RP-initiated logout sends `id_token_hint`. Refresh-token revocation is optional (`OIDC_REVOKE_ON_LOGOUT`).
+- Separate public issuer (`OIDC_OP_ISSUER`) and internal discovery URL.
+- A token-endpoint error taxonomy and a per-process circuit breaker (`OIDC_CIRCUIT_BREAKER`).
+- `request.oidc`, `get_access_token(request, min_ttl=)`, `get_id_claims(request)`, `sessions.access_token_for(session_id, min_ttl=, wait=)`, and `client_roles()`.
+- Signals: `oidc_session_started`, `oidc_session_refreshed`, `oidc_session_refresh_failed`, `oidc_session_ended`, `oidc_backchannel_logout_received`. Structured events go to the `oauth2_authcodeflow.events` logger.
+- `contrib.drf`: session and bearer authentication with `authenticate_header` (401, not 403), and an exception handler with error codes.
+- `contrib.channels`: ASGI middleware and consumer mixins. Sockets close with 4401 when their sign-in ends.
+- Commands `oidc_check`, `oidc_cleanup` and `oidc_rotate_keys`; a read-only admin for sign-ins.
+- System checks E001 to E004 and W001 to W003.
+- `oauth2_authcodeflow.testing`: `create_oidc_session`, `FakeOP`, `make_signed_token`, and the pytest fixture `oidc_op` (entry point `pytest11`).
+- CI (GitHub Actions): flake8 and mypy; a unit matrix of Python 3.10–3.13 × Django 4.2/5.2/6.0; a Postgres 16 concurrency suite; a nightly Keycloak 26 integration suite.
+### Removed
+- `LogoutByOPView` and `OIDC_VIEW_LOGOUT_BY_OP`; use back-channel logout.
+- `OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS`, the fixed 7-day cap.
+- The `from_cli` sign-in parameter.
+- Tokens in the Django session (`oidc_*` keys).
+### Deprecated
+- `RefreshAccessTokenMiddleware`, `RefreshSessionMiddleware`, `Oauth2MiddlewareMixin` and `MiddlewareException`.
+- `purge_blacklisted_tokens` (use `oidc_cleanup`). `BlacklistedToken` is frozen and will be dropped in 4.0.
+
 ## 2.0.0
 ### Security
 - Replace `python-jose` by `PyJWT[crypto]>=2.15`: `python-jose` <= 3.5.0 (GHSA-3qf3-8w2g-rqmx) and its `ecdsa` dependency (GHSA-wj6h-64fc-37mp) have no fixed release. The ID token validation keeps the previous rules (signature, `exp`, `nbf`, `jti`, `aud` only when present, nonce).

@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "django-oauth2-codeflow"
-version = "2.0.0"
-description = "Authenticate with any OpenId Connect/Oauth2 provider through authorization code flow. PKCE is also supported."
+version = "3.0.0"
+description = "Long-lived, secure Django sign-ins with any OpenID Connect provider: authorization code flow with PKCE, encrypted server-side tokens, single-flight refresh and back-channel logout."
 authors = ["Melih Sünbül <m.sunbul@excellence-cloud.com>"]
 maintainers = ["Melih Sünbül <m.sunbul@excellence-cloud.com>"]
 license = "MIT"
@@ -22,16 +22,16 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Framework :: Django",
     "Framework :: Django :: 4.2",
-    "Framework :: Django :: 5.0",
-    "Framework :: Django :: 5.1",
     "Framework :: Django :: 5.2",
+    "Framework :: Django :: 6.0",
+    "Framework :: Pytest",
     "Topic :: Internet :: WWW/HTTP :: Session",
     "Topic :: Security",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Typing :: Typed",
 ]
 packages = [{include = "oauth2_authcodeflow"}]
-include = ["CHANGELOG.md", "OP.md"]
+include = ["CHANGELOG.md", "OP.md", "UPGRADING.md"]
 
 [tool.poetry.urls]
 # https://github.com/pypi/warehouse/blob/main/warehouse/templates/packaging/detail.html#L20
@@ -46,7 +46,18 @@ include = ["CHANGELOG.md", "OP.md"]
 python = "^3.10"
 django = ">=4.2"
 pyjwt = {extras = ["crypto"], version = ">=2.15"}
-requests = ">=2.28"
+requests = ">=2.31"
+cryptography = ">=42"
+djangorestframework = {version = ">=3.14", optional = true}
+channels = {version = ">=4.0", optional = true}
+
+[tool.poetry.extras]
+drf = ["djangorestframework"]
+channels = ["channels"]
+
+[tool.poetry.plugins."pytest11"]
+# named after the module, so that a `pytest_plugins` entry for it never registers it twice
+"oauth2_authcodeflow.testing.pytest_plugin" = "oauth2_authcodeflow.testing.pytest_plugin"
 
 [tool.poetry.group.dev.dependencies]
 flake8 = "*"
@@ -58,6 +69,10 @@ pytest = "*"
 pytest-cov = "*"
 pytest-django = "*"
 pytest-html = "*"
+pytest-timeout = "*"
+psycopg2-binary = "*"
+djangorestframework = "*"
+channels = "*"
 
 [tool.poetry.group.typing.dependencies]
 django-types = "*"
@@ -86,7 +101,14 @@ addopts = [
     "--cov-report=term",
     "--cov-report=xml",
     "--cov-report=html",
+    "-m",
+    "not postgres and not keycloak",
 ]
+markers = [
+    "postgres: concurrency tests on a real Postgres (pytest test/pg -m postgres --ds=test.pg.settings_pg)",
+    "keycloak: integration tests against Keycloak 26 in Docker (pytest test/keycloak -m keycloak --ds=test.keycloak.settings_kc)",
+]
+timeout = 300
 [tool.coverage.run]
 source = ["oauth2_authcodeflow"]
 omit = ["tests/*", "*/migrations/*", "*/__init__.py"]
