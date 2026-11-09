@@ -131,8 +131,9 @@ class TestOauth2MiddlewareMixin:
         mixin.check_blacklisted(request)
         BlacklistedToken.is_blacklisted.assert_called_once_with('abc123')
         BlacklistedToken.is_blacklisted.return_value = True
-        with pytest.raises(MiddlewareException, match=escape("token abc123 is blacklisted")):
+        with pytest.raises(MiddlewareException, match=escape("token is blacklisted")) as exc_info:
             mixin.check_blacklisted(request)
+        assert 'abc123' not in str(exc_info.value)  # never echo a token
 
     def test_get_next_url(self, rf, sf, settings):
         settings.OIDC_REDIRECT_OK_FIELD_NAME = 'ok'
@@ -208,11 +209,16 @@ class TestOauth2MiddlewareMixin:
         assert mixin.is_api_request(request=rf.get('/some/url')) is False
         assert mixin.is_api_request(request=rf.get('/api/url')) is True
 
-    def test_json_401(self, rf):
+    def test_json_401(self, rf, settings):
+        settings.OIDC_RP_CLIENT_ID = 'a_client'
         mixin = Oauth2MiddlewareMixin(MagicMock(), 'test', MagicMock())
-        resp = mixin.json_401(rf.get('/'), 'my message')
+        resp = mixin.json_401(rf.get('/'), 'session_expired')
         assert resp.status_code == 401
-        assert resp.content == dumps({'error': 'my message', 'token_type': 'test'}).encode('utf8')
+        assert resp.content == dumps({'error': 'session_expired', 'login_url': '/oidc/authenticate', 'token_type': 'test'}).encode('utf8')
+        assert resp['WWW-Authenticate'] == 'Session realm="a_client"'
+        assert resp['Cache-Control'] == 'no-store'
+        resp = mixin.json_401(rf.get('/', HTTP_AUTHORIZATION='Bearer x'), 'not_authenticated')
+        assert resp['WWW-Authenticate'] == 'Bearer realm="a_client"'
 
     def test_re_authent(self, rf, settings):
         settings.OIDC_REDIRECT_OK_FIELD_NAME = 'ok'
@@ -249,30 +255,46 @@ class TestOauth2MiddlewareMixin:
     @patch('oauth2_authcodeflow.middleware.Oauth2MiddlewareMixin.get_failure_url')
     @patch('oauth2_authcodeflow.middleware.Oauth2MiddlewareMixin.get_next_url')
     @patch('oauth2_authcodeflow.middleware.Oauth2MiddlewareMixin.check_blacklisted')
-    def test_process_request(self, check_blacklisted, get_next_url, get_failure_url, destroy_session, re_authent_or_401, rf):
+    def test_process_request(self, check_blacklisted, get_next_url, get_failure_url, destroy_session, re_authent_or_401, rf, sf):
         get_next_url.return_value = '/next'
         get_failure_url.return_value = '/fail'
         re_authent_or_401.return_value = 're_authent_response'
         mixin = Oauth2MiddlewareMixin(MagicMock(), 'test', None)
         request = rf.get('/')
+        session = sf(request)
         resp = mixin.process_request(request)
         assert resp is None
-        check_blacklisted.assert_called_once_with(request)
+        # 2.1: the id token is no longer checked against the blacklist on every request
+        check_blacklisted.assert_not_called()
         get_next_url.assert_not_called()
         get_failure_url.assert_not_called()
         destroy_session.assert_not_called()
         re_authent_or_401.assert_not_called()
-        check_blacklisted.reset_mock()
+        # a session holding OIDC tokens is destroyed when it ends, and the client gets the machine readable code
+        session[constants.SESSION_ID_TOKEN] = 'abc123'
         check_function = MagicMock(side_effect=MiddlewareException("not good"))
         mixin = Oauth2MiddlewareMixin(MagicMock(), 'test', check_function)
         resp = mixin.process_request(request)
         assert resp == 're_authent_response'
-        check_blacklisted.assert_called_once_with(request)
+        check_blacklisted.assert_not_called()
         check_function.assert_called_once_with(request)
         get_next_url.assert_called_once_with(request)
         get_failure_url.assert_called_once_with(request)
         destroy_session.assert_called_once_with(request)
-        re_authent_or_401.assert_called_once_with(request, "not good", '/next', '/fail')
+        re_authent_or_401.assert_called_once_with(request, "session_expired", '/next', '/fail')
+        # a session without OIDC tokens (anonymous, pending login) is never destroyed
+        destroy_session.reset_mock()
+        re_authent_or_401.reset_mock()
+        del session[constants.SESSION_ID_TOKEN]
+        mixin.process_request(request)
+        destroy_session.assert_not_called()
+        re_authent_or_401.assert_called_once_with(request, "session_expired", '/next', '/fail')
+        # and neither is one whose exception says so
+        destroy_session.reset_mock()
+        session[constants.SESSION_ID_TOKEN] = 'abc123'
+        check_function.side_effect = MiddlewareException("not yet", error='not_authenticated', end_session=False)
+        mixin.process_request(request)
+        destroy_session.assert_not_called()
 
 
 class TestLoginRequiredMiddleware:
@@ -360,104 +382,60 @@ class TestRefreshAccessTokenMiddleware:
         settings.OIDC_RP_CLIENT_SECRET = 'client_secret'
         settings.OIDC_RP_FORCE_SECRET_WITH_PKCE = True
         settings.OIDC_RP_USE_PKCE = True
-        request_post.return_value.json.return_value = {
-            'access_token': '456789',
-            'expires_in': 120,
-        }
+        settings.OIDC_REFRESH_SKEW_SECONDS = 30
+        settings.OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS = 3600
+        request_post.return_value.json.return_value = {'access_token': '456789', 'expires_in': 120}
         request_post.return_value.status_code = 200
-        request_post.return_value.text = "some error"
-        # case not refreshable url
-        is_refreshable_url.return_value = False
-        request = rf.get('/')
-        session = sf(request)
-        session[constants.SESSION_ID_TOKEN] = 'abc123'
         middleware = RefreshAccessTokenMiddleware(MagicMock())
+        now = int(datetime.now(timezone.utc).timestamp())
+
+        def make_session(expires_in):
+            request = rf.get('/')
+            session = sf(request)
+            session[constants.SESSION_ID_TOKEN] = 'abc123'
+            session[constants.SESSION_REFRESH_TOKEN] = '13579'
+            session[constants.SESSION_ACCESS_TOKEN] = '123456'
+            session[constants.SESSION_ACCESS_EXPIRES_AT] = now + expires_in
+            session[constants.SESSION_EXPIRES_AT] = now + 60
+            session[constants.SESSION_OP_TOKEN_URL] = 'token_url'
+            session.save()
+            return request, session
+
+        # not refreshable url
+        is_refreshable_url.return_value = False
+        request, session = make_session(-20)
         middleware.check_access_token(request)
-        assert session.session_key is None
         request_post.assert_not_called()
-        # case no refresh token
         is_refreshable_url.return_value = True
-        session = sf(request)
-        session[constants.SESSION_ID_TOKEN] = 'abc123'
+        # valid beyond the refresh skew: nothing to do
+        request, session = make_session(120)
         middleware.check_access_token(request)
-        assert session.session_key is None
         request_post.assert_not_called()
-        # case not expired
-        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=20)).timestamp()
-        session = sf(request)
-        session[constants.SESSION_ID_TOKEN] = 'abc123'
-        session[constants.SESSION_REFRESH_TOKEN] = '13579'
-        session[constants.SESSION_ACCESS_TOKEN] = '123456'
-        session[constants.SESSION_ACCESS_EXPIRES_AT] = expires_at
-        session[constants.SESSION_OP_TOKEN_URL] = 'token_url'
-        middleware.check_access_token(request)
-        assert session.session_key is None
-        request_post.assert_not_called()
-        # case expired, but same id token
-        expires_at = (datetime.now(timezone.utc) - timedelta(seconds=20)).timestamp()
-        expected_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=120)).timestamp()
-        session = sf(request)
-        session[constants.SESSION_ID_TOKEN] = 'abc123'
-        session[constants.SESSION_REFRESH_TOKEN] = '13579'
-        session[constants.SESSION_ACCESS_TOKEN] = '123456'
-        session[constants.SESSION_ACCESS_EXPIRES_AT] = expires_at
-        session[constants.SESSION_OP_TOKEN_URL] = 'token_url'
-        middleware.check_access_token(request)
-        assert session.session_key is not None
-        assert session[constants.SESSION_ID_TOKEN] == 'abc123'
-        assert session[constants.SESSION_ACCESS_TOKEN] == '456789'
-        assert session[constants.SESSION_ACCESS_EXPIRES_AT] == expected_expires_at
-        assert session[constants.SESSION_REFRESH_TOKEN] == '13579'
-        request_post.assert_called_once_with('token_url', data=dict(
-            grant_type='refresh_token',
-            client_id=settings.OIDC_RP_CLIENT_ID,
-            client_secret=settings.OIDC_RP_CLIENT_SECRET,
-            refresh_token='13579',
-        ), timeout=10)
-        BlacklistedToken.blacklist.assert_not_called()
-        # case expired, different id token
-        # without client secret
-        settings.OIDC_RP_FORCE_SECRET_WITH_PKCE = False
-        session = sf(request)
-        session[constants.SESSION_ID_TOKEN] = 'abc123'
-        session[constants.SESSION_REFRESH_TOKEN] = '13579'
-        session[constants.SESSION_ACCESS_TOKEN] = '123456'
-        session[constants.SESSION_ACCESS_EXPIRES_AT] = expires_at
-        session[constants.SESSION_OP_TOKEN_URL] = 'token_url'
+        # inside the refresh skew (still valid) or expired: refreshed
+        for expires_in in (20, -20):
+            request_post.reset_mock()
+            request, session = make_session(expires_in)
+            middleware.check_access_token(request)
+            request_post.assert_called_once_with('token_url', data=dict(
+                grant_type='refresh_token',
+                client_id='client_id',
+                client_secret='client_secret',
+                refresh_token='13579',
+            ), timeout=10)
+            assert session[constants.SESSION_ACCESS_TOKEN] == '456789'
+            assert session[constants.SESSION_ACCESS_EXPIRES_AT] == now + 120
+            assert session[constants.SESSION_ID_TOKEN] == 'abc123'
+            assert session[constants.SESSION_REFRESH_TOKEN] == '13579'
+            # sliding idle timeout of the Django side of the session
+            assert session[constants.SESSION_EXPIRES_AT] == now + 3600
+        # new id and refresh tokens are stored; the old id token is NOT blacklisted any more
         request_post.reset_mock()
         request_post.return_value.json.return_value.update(id_token='abc456', refresh_token='24680')
+        request, session = make_session(-20)
         middleware.check_access_token(request)
-        assert session.session_key is not None
         assert session[constants.SESSION_ID_TOKEN] == 'abc456'
-        assert session[constants.SESSION_ACCESS_TOKEN] == '456789'
-        assert session[constants.SESSION_ACCESS_EXPIRES_AT] == expected_expires_at
         assert session[constants.SESSION_REFRESH_TOKEN] == '24680'
-        request_post.assert_called_once_with('token_url', data=dict(
-            grant_type='refresh_token',
-            client_id=settings.OIDC_RP_CLIENT_ID,
-            refresh_token='13579',
-        ), timeout=10)
-        BlacklistedToken.blacklist.assert_called_once_with('abc123')
-        # case refresh is denied by OP
-        # not using PKCE nor client secret
-        settings.OIDC_RP_USE_PKCE = False
-        settings.OIDC_RP_CLIENT_SECRET = None
-        request_post.reset_mock()
-        request_post.return_value.status_code = 400
-        session = sf(request)
-        session[constants.SESSION_ID_TOKEN] = 'abc123'
-        session[constants.SESSION_REFRESH_TOKEN] = '13579'
-        session[constants.SESSION_ACCESS_TOKEN] = '123456'
-        session[constants.SESSION_ACCESS_EXPIRES_AT] = expires_at
-        session[constants.SESSION_OP_TOKEN_URL] = 'token_url'
-        with pytest.raises(MiddlewareException, match=escape("some error")):
-            middleware.check_access_token(request)
-        request_post.assert_called_once_with('token_url', data=dict(
-            grant_type='refresh_token',
-            client_id=settings.OIDC_RP_CLIENT_ID,
-            client_secret='',
-            refresh_token='13579',
-        ), timeout=10)
+        BlacklistedToken.blacklist.assert_not_called()
 
 
 class TestRefreshSessionMiddleware:
@@ -529,7 +507,14 @@ class TestBearerAuthMiddleware:
         assert session.session_key is None
         assert getattr(request, 'user', None) is None
         BearerAuthenticationBackend.assert_not_called()
+        # 2.1: other schemes (Api-Key, Basic, …) are not this backend's business: no OP call, no warning
         request = rf.get('/', HTTP_AUTHORIZATION='Truc Much')
+        session = sf(request)
+        assert middleware.process_request(request) is None
+        assert session.session_key is None
+        assert getattr(request, 'user', None) is None
+        BearerAuthenticationBackend.assert_not_called()
+        request = rf.get('/', HTTP_AUTHORIZATION='Bearer Much')
         session = sf(request)
         assert middleware.process_request(request) is None
         assert session.session_key is None
@@ -539,14 +524,14 @@ class TestBearerAuthMiddleware:
         BearerAuthenticationBackend.reset_mock()
         BearerAuthenticationBackend.return_value.authenticate.reset_mock()
         BearerAuthenticationBackend.return_value.authenticate.return_value = 'a user'
-        request = rf.get('/', HTTP_AUTHORIZATION='Truc Much')
+        request = rf.get('/', HTTP_AUTHORIZATION='Bearer Much')
         session = sf(request)
         assert middleware.process_request(request) is None
         assert session.session_key is not None
         assert getattr(request, 'user', None) == 'a user'
         BearerAuthenticationBackend.assert_called_once_with()
         BearerAuthenticationBackend.return_value.authenticate.assert_called_once_with(request)
-        request = rf.get('/', HTTP_AUTHORIZATION='Truc Much')
+        request = rf.get('/', HTTP_AUTHORIZATION='Bearer Much')
         session = sf(request)
         session.save()
         expected_session_key = session.session_key

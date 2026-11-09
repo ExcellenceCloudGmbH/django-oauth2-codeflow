@@ -114,6 +114,10 @@ class AuthenticateView(CacheBaseView, UrlParamsMixin):
         session_updates[constants.SESSION_CHALLENGE] = code_verifier
 
     def fill_params_without_pkce(self, request: HttpRequest, session_updates: Dict[str, str], auth_params: Dict[str, str], from_cli: bool) -> None:
+        """
+        Fill `state` (CSRF protection of the callback) and `nonce` (id token replay protection).
+        Despite its historical name, this is called with and without PKCE.
+        """
         if from_cli:
             state = jwt.encode({'session_key': request.session.session_key}, settings.SECRET_KEY, algorithm='HS256')
         else:
@@ -138,8 +142,8 @@ class AuthenticateView(CacheBaseView, UrlParamsMixin):
             auth_params['prompt'] = 'consent'
         if use_pkce:
             self.fill_params_for_pkce(request, session_updates, auth_params, from_cli)
-        else:
-            self.fill_params_without_pkce(request, session_updates, auth_params, from_cli)
+        # state and nonce are always sent: PKCE protects the code exchange, not the callback against login CSRF
+        self.fill_params_without_pkce(request, session_updates, auth_params, from_cli)
         return session_updates, auth_params
 
     def get(self, request: HttpRequest) -> HttpResponse:
@@ -219,7 +223,8 @@ class CallbackView(CacheBaseView, UrlParamsMixin):
                 auth.logout(request)
             self._clear_cache(request)
             return self.get_url_with_params(failure_url, error=request.GET['error'])
-        elif constants.SESSION_LOGOUT_STATE in request.session and state:
+        elif constants.SESSION_LOGOUT_STATE in request.session and state and 'code' not in request.GET:
+            # an authorization code means a login callback, even if a previous logout left its state behind
             return self.logout_callback(request, next_url, failure_url)
         elif 'code' in request.GET and settings.OIDC_RP_USE_PKCE or state:
             return self.auth_callback(request, next_url, failure_url, use_pkce)
@@ -264,7 +269,11 @@ class CallbackView(CacheBaseView, UrlParamsMixin):
         session_challenge = request.session.pop(constants.SESSION_CHALLENGE, None)
         if not session_challenge:
             raise SuspiciousOperation('OIDC callback: challenge not found in session')
-        return None, None, session_challenge
+        if constants.SESSION_STATE not in request.session:
+            # login started by a version that sent no state with PKCE: nothing to compare
+            return None, None, session_challenge
+        state, session_nonce, _ = self.extract_auth_callback_params_without_pkce(request)
+        return state, session_nonce, session_challenge
 
     def extract_auth_callback_params_without_pkce(self, request: HttpRequest) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         session_state = request.session.pop(constants.SESSION_STATE, None)

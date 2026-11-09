@@ -171,12 +171,12 @@ Specific OIDC settings:
 | `OIDC_RP_SCOPES` | The OpenID Connect scopes to request during login.<br>The scopes could be usefull later to get access to other ressources.<br>`openid` must be in the list.<br>You can also include the `email` scope to ensure that the email field will be in the claims (*recommended*).<br>You can also include the `profile` scope to get more (like names, …) info in the `id_token` (*recommended*).<br>You can also get a `refresh_token` by specifying the `offline_access` scope. | `['openid', 'email', 'profile', 'offline_access']` |
 | `OIDC_RP_USERINFO_CLAIMS` | OpenID Connect authorization [request parameter `userinfo` member](https://openid.net/specs/openid-connect-core-1_0.html#ClaimsParameter) to optionaly add to id token request (dict type). | `None` |
 | `OIDC_RP_TOKEN_CLAIMS` | OpenID Connect authorization [request parameter `id_token` member](https://openid.net/specs/openid-connect-core-1_0.html#ClaimsParameter) to optionaly add to id token request (dict type). | `None` |
-| `OIDC_RP_SIGN_ALGOS_ALLOWED` | Sets the algorithms the IdP may use to sign ID tokens.<br>Typical values ar `HS256` (no key required) and `RS256` (public key required)<br>The public keys might be defined in `OIDC_RP_IDP_SIGN_KEY` or deduced using the `OIDC_OP_JWKS_URL` config. | `['HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512']` |
+| `OIDC_RP_SIGN_ALGOS_ALLOWED` | Sets the algorithms the IdP may use to sign ID tokens.<br>Asymmetric only by default; the public keys come from `OIDC_RP_IDP_SIGN_KEY` or the OP JWKS (RSA and EC keys).<br>`HS256`/`HS384`/`HS512` (keyed by the client secret) must be listed explicitly: anyone holding the client secret could otherwise forge tokens. | `['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512']` |
 | `OIDC_RP_IDP_SIGN_KEY` | Public RSA used to verify signatures. Overrides keys from JWKS endpoint.<br>Should be in `PEM` or `DER` format. | `None` |
 | `OIDC_CREATE_USER` | Enables or disables automatic user creation during authentication | `True` |
 | `OIDC_RANDOM_SIZE` | Sets the length of the random string used in the OAuth2 protocol. | `32` |
 | `OIDC_PROXY` | Defines a proxy for all requests to the OpenID Connect provider (fetch JWS, retrieve JWT tokens, Userinfo Endpoint).<br>The default is set to `None` which means the library will not use a proxy and connect directly.<br>For configuring a proxy check the Python requests documentation: <https://requests.readthedocs.io/en/master/user/advanced/#proxies> | `None` |
-| `OIDC_TIMEOUT` | Defines a timeout for all requests to the OpenID Connect provider (fetch JWS, retrieve JWT tokens, Userinfo Endpoint).<br>The default is set to `None` which means the library will wait indefinitely.<br>The time can be defined as seconds (integer).<br>More information about possible configuration values, see Python requests: <https://requests.readthedocs.io/en/master/user/quickstart/#timeouts> | `None` |
+| `OIDC_TIMEOUT` | Timeout of every request to the OpenID Connect provider (discovery, JWKS, token, refresh, userinfo).<br>Seconds (int or float) or a `(connect, read)` tuple, see Python requests: <https://requests.readthedocs.io/en/master/user/quickstart/#timeouts> | `10` |
 | `OIDC_REDIRECT_OK_FIELD_NAME` | Sets the GET parameter that is being used to define the redirect URL after succesful authentication | `'next'` |
 | `OIDC_REDIRECT_ERROR_FIELD_NAME` | Sets the GET parameter that is being used to define the redirect URL after failed authentication | `'fail'` |
 | `OIDC_DJANGO_USERNAME_FUNC` | Function or dotted path to a function that compute the django username based on claims.<br>The username should be unique for this app.<br>The default is to use a base64 url encode of the email hash (sha1). | `get_default_django_username` |
@@ -184,10 +184,24 @@ Specific OIDC settings:
 | `OIDC_FIRSTNAME_CLAIM` | You can also provide a lambda that takes all the claims as argument and return a firstname | `'given_name'` |
 | `OIDC_LASTNAME_CLAIM` | You can also provide a lambda that takes all the claims as argument and return a lastname | `'family_name'` |
 | `OIDC_EXTEND_USER` | Callable that takes the `user`, the `claims` and optionaly the `request` and `access_token` as arguments and that can extend user properties.<br>You can also specify a dotted path to a callable. | `None` |
-| `OIDC_UNUSABLE_PASSWORD` | Scramble the password on each SSO connection/renewal.<br>If `False`, it will only scramble it when creating an account | `True` |
+| `OIDC_UNUSABLE_PASSWORD` | Scramble the password on each SSO connection/renewal.<br>If `False`, the password is only made unusable when the account is created. `True` changes the password hash at every login, which logs the user out of their other Django sessions. | `False` |
 | `OIDC_BLACKLIST_TOKEN_TIMEOUT_SECONDS` | 7 days by default | `7 * 86400` |
 | `OIDC_AUTHORIZATION_HEADER_PREFIX` | Only used when using authorization in header:<br>`Authorization: Bearer id_token`<br>This is only possible if `oauth2_authcodeflow.middleware.BearerAuthMiddleware` has been added to `MIDDLEWARE` setting list. | `'Bearer'` |
 | `OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS` | The `RefreshAccessTokenMiddleware` and `RefreshSessionMiddleware` will use this list to bypass auth checks.<br>Any url listed here will not be tried to be authenticated using Auth Code Flow.<br>You should include at least any failure/error or admin urls in it. | `[]` |
 | `OIDC_MIDDLEWARE_LOGIN_REQUIRED_REDIRECT` | Redirect to login page if not authenticated when using `LoginRequiredMiddleware`. | `True` |
 | `OIDC_MIDDLEWARE_API_URL_PATTERNS` | The `RefreshAccessTokenMiddleware` and `RefreshSessionMiddleware` will use this list to answer JSON response in case of refresh failure.<br>Expected list of regexp URL patterns. | `['^/api/']` |
-| `OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS` | 7 days by default | `7 * 86400` |
+| `OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS` | Idle timeout of the Django side of the session, moved forward on every successful token refresh | `7 * 86400` |
+| `OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS` | URL patterns on which the session is neither checked nor refreshed | `[]` |
+| `OIDC_REFRESH_SKEW_SECONDS` | Refresh the access token this many seconds before it expires, so an OP hiccup can be served with the current token | `30` |
+| `OIDC_RETRY_AFTER_SECONDS` | `Retry-After` of the 503 answered when the OP cannot be reached and the access token has expired | `5` |
+| `OIDC_REFRESH_LOCK_CACHE_ALIAS` | Django cache alias of the cross-process refresh lock. Unset: `redis` when `DEPLOYMENT_ENVIRONMENT` is set, else `local`, falling back to `default` | `None` |
+
+## Failure handling (2.1)
+
+- Only an `invalid_grant` answer to a refresh ends the session (forced logout, logged at WARNING with its reason).
+- Any other refresh failure keeps the session: the still valid access token is served, otherwise `503` with
+  `Retry-After` is answered — JSON `{"error": "auth_unavailable", "retry_after": N}` for API/fetch requests,
+  a self-retrying page for navigations.
+- Requests needing a (new) login: page navigations are redirected to the login, fetch/XHR/API requests get
+  `401` JSON `{"error": "not_authenticated" | "session_expired", "login_url": "..."}` with `WWW-Authenticate`
+  and `Cache-Control: no-store`. Anonymous sessions are never destroyed.

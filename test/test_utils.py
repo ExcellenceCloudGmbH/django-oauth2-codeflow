@@ -65,6 +65,8 @@ from oauth2_authcodeflow.utils import (
 @patch('oauth2_authcodeflow.utils.settings')
 @patch('oauth2_authcodeflow.utils.request_get')
 def test_get_oidc_urls(request_get, settings, config, session):
+    settings.OIDC_TIMEOUT = 10
+    settings.OIDC_PROXY = None
     for key, value in config.items():
         setattr(settings, key, value)
     discovery_response1 = MagicMock(**{'json.return_value': {
@@ -88,7 +90,8 @@ def test_get_oidc_urls(request_get, settings, config, session):
             {'kid': '126', 'kty': 'TEST', 'use': 'sig', 'value': 4},
         ],
     }})
-    request_get.side_effect = lambda url: {'discovery_url1': discovery_response1, 'discovery_url2': discovery_response2, 'jwks_url': jwks_response}.get(url)
+    responses = {'discovery_url1': discovery_response1, 'discovery_url2': discovery_response2, 'jwks_url': jwks_response}
+    request_get.side_effect = lambda url, **kwargs: responses.get(url)
     if not session and not settings.OIDC_OP_DISCOVERY_DOCUMENT_URL and not settings.OIDC_OP_AUTHORIZATION_URL:
         ctx = pytest.raises(ImproperlyConfigured, match="OIDC_OP_AUTHORIZATION_URL is undefined")
     else:
@@ -118,20 +121,20 @@ def test_get_oidc_urls(request_get, settings, config, session):
         if not session:
             if settings.OIDC_OP_DISCOVERY_DOCUMENT_URL == 'discovery_url1':
                 assert request_get.call_count == 2
-                request_get.assert_any_call(settings.OIDC_OP_DISCOVERY_DOCUMENT_URL)
+                request_get.assert_any_call(settings.OIDC_OP_DISCOVERY_DOCUMENT_URL, timeout=10)
                 discovery_response1.json.assert_called_once()
                 discovery_response2.json.assert_not_called()
-                request_get.assert_any_call('jwks_url')
+                request_get.assert_any_call('jwks_url', timeout=10)
                 jwks_response.json.assert_called_once()
             elif settings.OIDC_OP_DISCOVERY_DOCUMENT_URL == 'discovery_url2':
                 assert request_get.call_count == 1
-                request_get.assert_any_call(settings.OIDC_OP_DISCOVERY_DOCUMENT_URL)
+                request_get.assert_any_call(settings.OIDC_OP_DISCOVERY_DOCUMENT_URL, timeout=10)
                 discovery_response1.json.assert_not_called()
                 discovery_response2.json.assert_called_once()
                 jwks_response.json.assert_not_called()
             else:
                 assert request_get.call_count == 1
-                request_get.assert_any_call('jwks_url')
+                request_get.assert_any_call('jwks_url', timeout=10)
                 jwks_response.json.assert_called_once()
 
 
@@ -151,3 +154,40 @@ def test_login_required(orig_login_required, settings):
         redirect_field_name='when_ok',
         login_url=reverse(constants.OIDC_URL_AUTHENTICATION_NAME) + '?when_error=%2F',
     )
+
+
+def test_op_request_kwargs(settings):
+    from oauth2_authcodeflow.utils import op_request_kwargs
+    assert op_request_kwargs() == {'timeout': 10}
+    settings.OIDC_TIMEOUT = (3.05, 8)
+    settings.OIDC_PROXY = {'https': 'http://proxy:3128'}
+    assert op_request_kwargs() == {'timeout': (3.05, 8), 'proxies': {'https': 'http://proxy:3128'}}
+
+
+def test_is_signing_jwk():
+    from oauth2_authcodeflow.utils import is_signing_jwk
+    assert is_signing_jwk({'kid': '1', 'kty': 'RSA', 'use': 'sig'})
+    assert is_signing_jwk({'kid': '2', 'kty': 'EC', 'use': 'sig', 'crv': 'P-256'})
+    assert is_signing_jwk({'kid': '3', 'kty': 'RSA'})  # no `use`: any purpose
+    assert not is_signing_jwk({'kid': '4', 'kty': 'RSA', 'use': 'enc'})
+    assert not is_signing_jwk({'kid': '5', 'kty': 'oct', 'use': 'sig'})
+    assert not is_signing_jwk({'kty': 'RSA', 'use': 'sig'})  # no kid
+
+
+@patch('oauth2_authcodeflow.utils.request_get')
+def test_get_oidc_urls_keeps_ec_keys_and_uses_the_timeout(request_get, settings):
+    settings.OIDC_OP_DISCOVERY_DOCUMENT_URL = 'discovery_url'
+    settings.OIDC_TIMEOUT = 4
+    discovery = MagicMock(**{'json.return_value': {
+        'authorization_endpoint': 'auth_url', 'token_endpoint': 'token_url', 'userinfo_endpoint': 'user_url', 'jwks_uri': 'jwks_url',
+    }})
+    jwks = MagicMock(**{'json.return_value': {'keys': [
+        {'kid': 'ec', 'kty': 'EC', 'use': 'sig', 'crv': 'P-256', 'x': 'x', 'y': 'y'},
+        {'kid': 'rsa', 'kty': 'RSA', 'n': 'n', 'e': 'AQAB'},
+        {'kid': 'enc', 'kty': 'RSA', 'use': 'enc', 'n': 'n', 'e': 'AQAB'},
+    ]}})
+    request_get.side_effect = lambda url, **kwargs: {'discovery_url': discovery, 'jwks_url': jwks}[url]
+    session = OIDCUrlsMixin().get_oidc_urls({})
+    assert set(session[constants.SESSION_OP_JWKS]) == {'ec', 'rsa'}
+    request_get.assert_any_call('discovery_url', timeout=4)
+    request_get.assert_any_call('jwks_url', timeout=4)

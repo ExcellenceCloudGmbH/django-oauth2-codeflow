@@ -23,7 +23,6 @@ from django.contrib.auth.models import (
 from django.core.exceptions import SuspiciousOperation
 from django.http.request import HttpRequest
 from django.urls import reverse
-from jwt.algorithms import RSAAlgorithm
 from jwt.exceptions import PyJWTError
 from requests import get as request_get
 from requests import post as request_post
@@ -33,7 +32,10 @@ from .conf import (
     settings,
 )
 from .models import BlacklistedToken
-from .utils import OIDCUrlsMixin
+from .utils import (
+    OIDCUrlsMixin,
+    op_request_kwargs,
+)
 
 logger = getLogger(__name__)
 
@@ -48,7 +50,7 @@ class AuthenticationMixin:
         algo = header['alg']
         if algo not in settings.OIDC_RP_SIGN_ALGOS_ALLOWED:
             raise SuspiciousOperation(f"The token algorithm {algo} is not allowed ({', '.join(settings.OIDC_RP_SIGN_ALGOS_ALLOWED)})")
-        if algo.startswith('RS'):
+        if algo[:2] in ('RS', 'PS', 'ES'):
             if settings.OIDC_RP_IDP_SIGN_KEY:
                 key = settings.OIDC_RP_IDP_SIGN_KEY
             else:
@@ -61,8 +63,8 @@ class AuthenticationMixin:
             raise NotImplementedError(f"Algo {algo} cannot be handled by this authentication backend")
         try:
             if isinstance(key, dict):
-                # JWK from the OP JWKS endpoint
-                key = RSAAlgorithm.from_jwk(key)
+                # JWK from the OP JWKS endpoint (RSA or EC)
+                key = jwt.PyJWK(key).key
             elif isinstance(key, bytes) and key.startswith(b'-----BEGIN CERTIFICATE-----'):
                 # python-jose accepted a PEM X.509 certificate as OIDC_RP_IDP_SIGN_KEY, PyJWT only accepts keys
                 key = load_pem_x509_certificate(key).public_key()
@@ -108,6 +110,7 @@ class AuthenticationMixin:
             claims.update(request_get(
                 request.session[constants.SESSION_OP_USERINFO_URL],
                 headers={'Authorization': f'{settings.OIDC_AUTHORIZATION_HEADER_PREFIX} {access_token}'},
+                **op_request_kwargs(),
             ).json())
             return claims
         else:
@@ -203,6 +206,7 @@ class AuthenticationBackend(ModelBackend, AuthenticationMixin):
                 request.session[constants.SESSION_OP_TOKEN_URL],
                 data=params,
                 headers=dict(origin=params['redirect_uri']) if settings.OIDC_RP_AZURE_SPA else None,
+                **op_request_kwargs(),
             )
             if resp.status_code != 200:
                 raise SuspiciousOperation(f"{resp.status_code} {resp.text}")
@@ -251,7 +255,7 @@ class BearerAuthenticationBackend(ModelBackend, AuthenticationMixin, OIDCUrlsMix
             if prefix != self.authorization_prefix:
                 raise SuspiciousOperation(f"Authorization should start with a {self.authorization_prefix} prefix")
             if BlacklistedToken.is_blacklisted(id_token):
-                raise SuspiciousOperation(f"token {id_token} is blacklisted")
+                raise SuspiciousOperation("token is blacklisted")
             id_claims = self.validate_and_decode_id_token(id_token, nonce=None, jwks=self.oidc_urls.get(constants.SESSION_OP_JWKS, {}))
             user = self.get_or_create_user(request, id_claims, '')
             return user
