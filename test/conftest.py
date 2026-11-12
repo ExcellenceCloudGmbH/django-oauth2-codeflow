@@ -1,15 +1,23 @@
 import pytest
-from django.contrib.sessions.middleware import SessionMiddleware
+
+pytest_plugins = ['oauth2_authcodeflow.testing.pytest_plugin']
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state():
+    from django.core.cache import cache
+
+    from oauth2_authcodeflow import sessions
+    from oauth2_authcodeflow.breaker import reset_breakers
+    cache.clear()
+    reset_breakers()
+    sessions.reset_refresh_failures()
+    yield
+    reset_breakers()
+    sessions.reset_refresh_failures()
 
 
 @pytest.fixture
-def sf():
-    """
-    Session factory
-    takes a request as argument and create a session (not saved) on it
-    """
-    def session_factory(request):
-        middleware = SessionMiddleware(lambda x: None)
-        middleware.process_request(request)
-        return request.session
-    yield session_factory
+def user(db):
+    from django.contrib.auth import get_user_model
+    return get_user_model().objects.create_user(username='alice', email='alice@example.test', password='pw-alice-123')

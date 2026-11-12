@@ -1,3 +1,10 @@
+"""Settings of the library.
+
+Every setting has a default here; projects override them in their Django settings.
+Names from 2.x that were renamed are still read (with a ``DeprecationWarning``) and
+names that no longer have an effect are reported once. See ``UPGRADING.md``.
+"""
+import warnings
 from base64 import urlsafe_b64encode
 from hashlib import sha1
 from types import FunctionType
@@ -32,151 +39,178 @@ def get_default_django_username(claims: Dict) -> str:
     ).decode('ascii').rstrip('=')
 
 
+#: Profile claims kept on ``OIDCSession.claims`` (never tokens). ``'*'`` keeps every claim.
+DEFAULT_CLAIMS_ALLOWLIST = [
+    'sub', 'iss', 'aud', 'azp', 'sid', 'auth_time', 'acr', 'amr',
+    'email', 'email_verified', 'name', 'given_name', 'family_name', 'preferred_username',
+    'locale', 'zoneinfo', 'groups', 'roles', 'client_roles', 'client_role', 'realm_role',
+]
+
+DEFAULT_CIRCUIT_BREAKER = {
+    'failures': 5,          # transient failures within ``window`` seconds open the breaker
+    'window': 30,
+    'cooldown': 15,         # seconds before a half-open probe is allowed
+    'config_cooldown': 300,  # configuration errors keep the breaker open longer
+}
+
 DEFAULTS: Dict[str, Tuple[Any, Any]] = {
+    # --- views (dotted paths or classes)
     'OIDC_VIEW_AUTHENTICATE': (type, f'{__package__}.views.AuthenticateView'),
     'OIDC_VIEW_CALLBACK': (type, f'{__package__}.views.CallbackView'),
     'OIDC_VIEW_LOGOUT': (type, f'{__package__}.views.LogoutView'),
     'OIDC_VIEW_TOTAL_LOGOUT': (type, f'{__package__}.views.TotalLogoutView'),
-    'OIDC_VIEW_LOGOUT_BY_OP': (type, f'{__package__}.views.LogoutByOPView'),
-    # URL of your OpenID connect Provider discovery document url (recommended).
-    # If you provide this, the following configs will be ignored:
-    # - `OIDC_OP_AUTHORIZATION_URL`
-    # - `OIDC_OP_TOKEN_URL`
-    # - `OIDC_OP_USERINFO_URL`
-    # - `OIDC_OP_JWKS_URL`
+    'OIDC_VIEW_BACKCHANNEL_LOGOUT': (type, f'{__package__}.views.BackchannelLogoutView'),
+    # --- OpenID provider
+    # Discovery document. It may point to an internal URL of the OP (e.g. a cluster
+    # Service) as long as the OP resolves back-channel URLs dynamically; the expected
+    # public issuer is then given by OIDC_OP_ISSUER.
     'OIDC_OP_DISCOVERY_DOCUMENT_URL': (str, None),
-    # URL of your OpenID connect Provider authorization endpoint (not recommended, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred).
+    # Expected ``iss`` of every token. Defaults to the discovery document's ``issuer``.
+    # When set, it must equal the discovery ``issuer`` (else: configuration error).
+    'OIDC_OP_ISSUER': (str, None),
+    # Per-endpoint overrides, applied on top of the discovery document.
     'OIDC_OP_AUTHORIZATION_URL': (str, None),
-    # URL of your OpenID connect Provider token endpoint (not recommended, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred).
     'OIDC_OP_TOKEN_URL': (str, None),
-    # URL of your OpenID connect Provider userinfo endpoint (not recommended, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred).
     'OIDC_OP_USERINFO_URL': (str, None),
-    # URL of your OpenId connect Provider endpoint to get public signing keys (in `PEM` or `DER` format).
-    # This is used to verify the `id_token`.
-    # This is not recommended to provide this url here but rather use `OIDC_OP_DISCOVERY_DOCUMENT_URL` config.
     'OIDC_OP_JWKS_URL': (str, None),
-    # URL of your OpenID connect Provider end session endpoint (not recommended, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred).
     'OIDC_OP_END_SESSION_URL': (str, None),
-    # Fetch user info on login or not.
+    'OIDC_OP_REVOCATION_URL': (str, None),
+    # Complete the id token claims with the userinfo endpoint at login.
     'OIDC_OP_FETCH_USER_INFO': (bool, True),
-    # Do a call to total logout will call the OP for a logout. Default true.
-    # Be careful, some OP will not follow the RFC and will not allow the user to NOT logout all connected apps.
-    # Azure is such a bad example.
+    # Total logout redirects to the OP end-session endpoint.
     'OIDC_OP_TOTAL_LOGOUT': (bool, True),
-    # expected email key.
     'OIDC_OP_EXPECTED_EMAIL_CLAIM': (str, 'email'),
-    # `OIDC_OP_EXPECTED_EMAIL_CLAIM` value is automatically included in this list.
     'OIDC_OP_EXPECTED_CLAIMS': (list, []),
-    # OpenID Connect client ID provided for your Relaying Party/client by your OpenIdConnect Provider
+    # --- relying party (client)
     'OIDC_RP_CLIENT_ID': (str, ImproperlyConfigured),
-    # OpenID Connect client secret provided for your Relaying Party/client by your OpenIdConnect Provider.
-    # Could be empty in PKCE case.
     'OIDC_RP_CLIENT_SECRET': (str, ImproperlyConfigured),
-    # `PKCE` improve security, disable it only if your provider cannot handle it.
+    # 'client_secret_post', 'client_secret_basic' or 'none'.
+    # None: 'client_secret_post' when a secret is configured, else 'none'.
+    'OIDC_RP_CLIENT_AUTH_METHOD': (str, None),
     'OIDC_RP_USE_PKCE': (bool, True),
-    # Force to send the client secret even when using `PKCE`. Only use this option if your provider don’t support PKCE without secret.
-    'OIDC_RP_FORCE_SECRET_WITH_PKCE': (bool, False),
-    # Force to ask for consent on login, even if `offline_access` is not in scopes
     'OIDC_RP_FORCE_CONSENT_PROMPT': (bool, False),
-    # Some OP server (Azure) require the 'Origin' header when using PKCE and SPA (single page application)
     'OIDC_RP_AZURE_SPA': (bool, False),
-    # The OpenID Connect scopes to request during login.
-    # The scopes could be usefull later to get access to other ressources.
-    # `openid` must be in the list.
-    # You can also include the `email` scope to ensure that the email field will be in the claims (recommended).
-    # You can also include the `profile` scope to get more (like names, …) info in the `id_token` (recommended).
-    # You can also get a `refresh_token` by specifying the `offline_access` scope.
-    'OIDC_RP_SCOPES': (list, ['openid', 'email', 'profile', 'offline_access']),
-    # The OpenID Connect list of individual claims to request (optional).
-    # OpenID Connect authorization request parameter `userinfo` dict to add to id token request.
+    'OIDC_RP_SCOPES': (list, ['openid', 'email', 'profile']),
     'OIDC_RP_USERINFO_CLAIMS': (dict, None),
-    # OpenID Connect authorization request parameter `id_token` dict to add to id token request.
     'OIDC_RP_TOKEN_CLAIMS': (dict, None),
-    # Sets the algorithms the IdP may use to sign ID tokens.
-    # Asymmetric algorithms only by default: the public keys come from `OIDC_RP_IDP_SIGN_KEY` or the OP JWKS.
-    # 'HS256'/'HS384'/'HS512' (signed with the client secret) are still supported but must be listed explicitly:
-    # anyone holding the client secret could otherwise forge tokens.
-    'OIDC_RP_SIGN_ALGOS_ALLOWED': (list, ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512']),
-    # Public RSA used to verify signatures. Overrides keys from JWKS endpoint.
-    # Should be in PEM or DER format.
-    'OIDC_RP_IDP_SIGN_KEY': (bytes, None),
-    # Enables or disables automatic user creation during authentication
-    'OIDC_CREATE_USER': (bool, True),
-    # Sets the length of the random string used in the OAuth2 protocol.
+    # Asymmetric algorithms only; HS* is never accepted (system check E002).
+    'OIDC_RP_SIGN_ALGOS_ALLOWED': (list, ['RS256', 'PS256', 'ES256']),
+    # Static public key (PEM key or certificate) that overrides the JWKS.
+    'OIDC_RP_IDP_SIGN_KEY': ((bytes, str), None),
+    'OIDC_ID_TOKEN_LEEWAY_SECONDS': (int, 30),
+    # --- login flow
+    'OIDC_LOGIN_STATE_TTL_SECONDS': (int, 600),
+    'OIDC_LOGIN_MAX_PENDING': (int, 5),
+    # Extra hosts allowed in ``next``/``fail`` (the request host is always allowed).
+    'OIDC_ALLOWED_REDIRECT_HOSTS': (list, []),
     'OIDC_RANDOM_SIZE': (int, 32),
-    # Defines a proxy for all requests to the OpenID Connect provider (fetch JWS, retrieve JWT tokens, Userinfo Endpoint).
-    # The default is set to None which means the library will not use a proxy and connect directly.
-    # For configuring a proxy check the Python requests documentation: https://requests.readthedocs.io/en/master/user/advanced/#proxies
-    'OIDC_PROXY': (dict, None),
-    # Defines a timeout for all requests to the OpenID Connect provider (discovery, JWKS, token, refresh, userinfo).
-    # Seconds (int or float) or a (connect, read) tuple, see Python requests:
-    # https://requests.readthedocs.io/en/master/user/quickstart/#timeouts
-    'OIDC_TIMEOUT': ((int, float, tuple), 10),
-    # Sets the GET parameter that is being used to define the redirect URL after succesful authentication
     'OIDC_REDIRECT_OK_FIELD_NAME': (str, 'next'),
-    # Sets the GET parameter that is being used to define the redirect URL after failed authentication
     'OIDC_REDIRECT_ERROR_FIELD_NAME': (str, 'fail'),
-    # Function or dotted path to a function that compute the django username based on claims.
-    # The username should be unique for this app.
-    # The default is to use a base64 encode of the email hash (sha1).
+    'OIDC_LOGIN_URL': (str, None),
+    # --- users
+    'OIDC_CREATE_USER': (bool, True),
     'OIDC_DJANGO_USERNAME_FUNC': (FunctionType, get_default_django_username),
-    # Default, by value None, is the value of `OIDC_OP_EXPECTED_EMAIL_CLAIM`
-    # You can also provide a lambda that takes all the claims as argument and return an email
     'OIDC_EMAIL_CLAIM': ((str, FunctionType), None),
-    # You can also provide a lambda that takes all the claims as argument and return a firstname
     'OIDC_FIRSTNAME_CLAIM': ((str, FunctionType), 'given_name'),
-    # You can also provide a lambda that takes all the claims as argument and return a lastname
     'OIDC_LASTNAME_CLAIM': ((str, FunctionType), 'family_name'),
-    # Callable (that takes the user, the claims and optionaly the request and access_token as arguments)
-    # to extend user with other potential additional information available in the claims or from another request
-    # You can also specify a dotted path to a callable
     'OIDC_EXTEND_USER': (FunctionType, None),
-    # Scramble the password on each SSO connection/renewal. If False (default), it is only made unusable when the account is created.
-    # True changes the password hash at every login, which invalidates the user's other Django sessions (other browsers, devices).
+    # True scrambles the password at every login, which ends the user's other Django
+    # sessions (session auth hash). Only applied on creation by default.
     'OIDC_UNUSABLE_PASSWORD': (bool, False),
-    'OIDC_BLACKLIST_TOKEN_TIMEOUT_SECONDS': (int, 7 * 86400),  # 7 days
-    # Only used when using authorization in header:
-    #   Authorization: Bearer id_token
-    # This is only possible if oauth2_authcodeflow.auth.BearerAuthenticationBackend has been added to AUTHENTICATION_BACKENDS config list.
-    'OIDC_AUTHORIZATION_HEADER_PREFIX': (str, 'Bearer'),
-    # The RefreshAccessTokenMiddleware and RefreshSessionMiddleware will use this list to bypass auth checks.
-    # Any url listed here will not be tried to be authenticated using Auth Code Flow.
-    # You should include at least any failure/error or admin urls in it.
-    'OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS': (list, []),
-    # Redirect to login page if not authenticated when using LoginRequiredMiddleware
-    'OIDC_MIDDLEWARE_LOGIN_REQUIRED_REDIRECT': (bool, True),
-    # The RefreshAccessTokenMiddleware and RefreshSessionMiddleware will use this list to answer JSON response in case of refresh failure.
-    # Expected list of regexp URL patterns.
-    'OIDC_MIDDLEWARE_API_URL_PATTERNS': (list, ['^/api/']),
-    # Idle timeout of the Django side of the session: moved forward on every successful token refresh.
-    'OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS': (int, 7 * 86400),  # 7 days
-    # The RefreshAccessTokenMiddleware and RefreshSessionMiddleware do not refresh or check the session on these URL patterns.
-    'OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS': (list, []),
-    # Refresh the access token this many seconds before it expires, so a transient OP failure can still be served
-    # with the current token instead of an error.
-    'OIDC_REFRESH_SKEW_SECONDS': (int, 30),
-    # `Retry-After` (seconds) sent with the 503 answered when the OP is unreachable and the access token has expired.
+    'OIDC_CLAIMS_ALLOWLIST': (list, DEFAULT_CLAIMS_ALLOWLIST),
+    # --- HTTP to the OP
+    'OIDC_HTTP_TIMEOUT': ((tuple, list, int, float), (3.05, 8)),
+    'OIDC_CA_BUNDLE': ((bool, str), True),
+    'OIDC_PROXY': (dict, None),
+    'OIDC_HTTP_POOL_MAXSIZE': (int, 20),
+    'OIDC_DISCOVERY_CACHE_SECONDS': (int, 3600),
+    'OIDC_JWKS_CACHE_SECONDS': (int, 3600),
+    'OIDC_JWKS_MIN_REFETCH_SECONDS': (int, 30),
+    # --- sessions
+    'OIDC_SESSION_KEY': (str, '_oidc_session_id'),
+    # 'eager': refresh in the middleware; 'lazy': only in get_access_token().
+    'OIDC_REFRESH_MODE': (str, 'eager'),
+    'OIDC_REFRESH_SKEW_SECONDS': (int, 60),
+    'OIDC_REFRESH_WAIT_SECONDS': ((int, float), 10),
+    'OIDC_ACCESS_MIN_USABLE_SECONDS': (int, 5),
+    'OIDC_CIRCUIT_BREAKER': (dict, DEFAULT_CIRCUIT_BREAKER),
     'OIDC_RETRY_AFTER_SECONDS': (int, 5),
-    # Django cache alias used for the cross-process refresh lock. When unset, the 2.0 behaviour is kept
-    # ('redis' when DEPLOYMENT_ENVIRONMENT is set, else 'local', falling back to 'default').
-    'OIDC_REFRESH_LOCK_CACHE_ALIAS': (str, None),
+    'OIDC_SESSION_RENEW_INTERVAL_SECONDS': (int, 3600),
+    # Absolute cap of a sign-in. None: the OP decides (refresh fails with invalid_grant).
+    'OIDC_SESSION_MAX_AGE_SECONDS': (int, None),
+    # Fernet keys (str or bytes); the first encrypts, all decrypt. None: derived from
+    # SECRET_KEY and SECRET_KEY_FALLBACKS with HKDF.
+    'OIDC_TOKEN_ENCRYPTION_KEYS': (list, None),
+    'OIDC_LEGACY_SESSION_MIGRATION': (bool, True),
+    # --- middlewares
+    # Paths without session/refresh handling (health checks, static assets, ...).
+    'OIDC_SESSION_EXEMPT_URL_PATTERNS': (list, []),
+    # Paths that LoginRequiredMiddleware lets through anonymous requests.
+    'OIDC_LOGIN_REQUIRED_EXEMPT_URL_PATTERNS': (list, []),
+    # Paths that always get JSON answers (never a redirect).
+    'OIDC_API_URL_PATTERNS': (list, ['^/api/']),
+    # Navigation requests without a session are redirected to the login view.
+    'OIDC_NAVIGATION_REDIRECT': (bool, True),
+    # --- bearer tokens
+    'OIDC_AUTHORIZATION_HEADER_PREFIX': (str, 'Bearer'),
+    'OIDC_BEARER_AUDIENCES': (list, None),
+    'OIDC_BEARER_ACCEPT_AZP': (bool, False),
+    'OIDC_BEARER_TOKEN_TYPE': (str, 'Bearer'),
+    'OIDC_BEARER_LEEWAY_SECONDS': (int, 30),
+    # --- logout
+    # RFC 7009 revocation of the refresh token on (total) logout. Off by default: a
+    # Keycloak client session is shared by every application using the same client.
+    'OIDC_REVOKE_ON_LOGOUT': (bool, False),
+    'OIDC_BACKCHANNEL_LOGOUT_ENABLED': (bool, True),
+    'OIDC_BACKCHANNEL_LOGOUT_MAX_AGE_SECONDS': (int, 300),
+    'OIDC_CACHE_ALIAS': (str, 'default'),
+    # 'auto' (when channels is installed), 'on' or 'off'.
+    'OIDC_CHANNELS_NOTIFY': (str, 'auto'),
+    # --- frozen 2.x model
+    'OIDC_BLACKLIST_TOKEN_TIMEOUT_SECONDS': (int, 7 * 86400),
 }
 
 
+def _force_secret_to_auth_method(value: Any) -> Optional[str]:
+    return 'client_secret_post' if value else None
+
+
+#: 2.x names that are still read: old name -> (new name, value transformation)
+DEPRECATED: Dict[str, Tuple[str, Optional[Callable[[Any], Any]]]] = {
+    'OIDC_TIMEOUT': ('OIDC_HTTP_TIMEOUT', None),
+    'OIDC_RP_FORCE_SECRET_WITH_PKCE': ('OIDC_RP_CLIENT_AUTH_METHOD', _force_secret_to_auth_method),
+    'OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS': ('OIDC_LOGIN_REQUIRED_EXEMPT_URL_PATTERNS', None),
+    'OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS': ('OIDC_SESSION_EXEMPT_URL_PATTERNS', None),
+    'OIDC_MIDDLEWARE_API_URL_PATTERNS': ('OIDC_API_URL_PATTERNS', None),
+    'OIDC_MIDDLEWARE_LOGIN_REQUIRED_REDIRECT': ('OIDC_NAVIGATION_REDIRECT', None),
+}
+
+#: 2.x names without effect in 3.0: name -> explanation
+REMOVED: Dict[str, str] = {
+    'OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS': (
+        "the OP decides how long a sign-in lasts; use OIDC_SESSION_MAX_AGE_SECONDS for an absolute cap"
+    ),
+    'OIDC_VIEW_LOGOUT_BY_OP': "the front-channel logout view was removed; use the back-channel logout endpoint",
+}
+
+_NEW_TO_OLD = {new: old for old, (new, _) in DEPRECATED.items()}
+
+
 class Settings:
-    """
-    A settings object, that allows settings to be accessed as properties.
-    """
+    """A settings object that allows settings to be accessed as properties."""
     defaults: Dict[str, Tuple[Any, Any]]
 
     def __init__(self, defaults: Optional[Dict[str, Tuple[Any, Any]]] = None) -> None:
         self.defaults = defaults or DEFAULTS
         self._cache: Set[str] = set()
+        self._warned: Set[str] = set()
         setting_changed.connect(self.reload)
 
     def __getattr__(self, attr: str) -> Any:
+        if attr.startswith('_'):
+            raise AttributeError(attr)
         atype, def_val = self.defaults.get(attr, (None, None))
-        val = getattr(dj_settings, attr, def_val)
+        val = self._raw(attr, def_val)
         if atype is None:  # other setting
             atype = type(val),
         elif not isinstance(atype, tuple):
@@ -186,6 +220,29 @@ class Settings:
         self._cache.add(attr)
         setattr(self, attr, val)
         return val
+
+    def _raw(self, attr: str, default: Any) -> Any:
+        if hasattr(dj_settings, attr):
+            return getattr(dj_settings, attr)
+        old = _NEW_TO_OLD.get(attr)
+        if old and hasattr(dj_settings, old):
+            _, transform = DEPRECATED[old]
+            self._warn_once(old, f"{old} is deprecated, use {attr} instead")
+            value = getattr(dj_settings, old)
+            return transform(value) if transform else value
+        return default
+
+    def _warn_once(self, name: str, message: str) -> None:
+        if name in self._warned:
+            return
+        self._warned.add(name)
+        warnings.warn(message, DeprecationWarning, stacklevel=4)
+
+    def warn_removed(self) -> None:
+        """Warn once about 2.x settings that have no effect anymore (called at app ready)."""
+        for name, why in REMOVED.items():
+            if hasattr(dj_settings, name):
+                self._warn_once(name, f"{name} has no effect anymore: {why}")
 
     def _check_type_and_get_value(self, attr: str, val: Any, atype: tuple) -> Any:
         if (FunctionType in atype or type in atype) and isinstance(val, str) and '.' in val:
@@ -198,19 +255,26 @@ class Settings:
 
     def reload(self, *args, **kwargs) -> None:
         attr = str(kwargs.get('setting'))
-        # hasattr cannot be used because it relies on getattr and __getattr__, so use the _cache
-        if attr in self._cache:
-            self._cache.remove(attr)
-        try:
-            delattr(self, attr)
-        except AttributeError:
-            pass
+        names = {attr}
+        if attr in DEPRECATED:
+            names.add(DEPRECATED[attr][0])
+        for name in names:
+            # hasattr cannot be used because it relies on getattr and __getattr__, so use the _cache
+            if name in self._cache:
+                self._cache.remove(name)
+            try:
+                delattr(self, name)
+            except AttributeError:
+                pass
 
 
 settings = Settings()
 
 
 __all__ = [
+    'DEFAULTS',
+    'DEPRECATED',
+    'REMOVED',
     'Settings',
     'constants',
     'get_default_django_username',

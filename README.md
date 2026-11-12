@@ -1,207 +1,408 @@
-Summary
-=======
+django-oauth2-codeflow
+======================
 
-[![pypi downloads][dl-image]][pypi-url]
-[![pypi status][status-image]][pypi-url]
-[![python versions][py-image]][pypi-url]
-[![django versions][django-image]][pypi-url]
-[![pipeline status][pipeline-image]][pipeline-url]
-[![coverage status][coverage-image]][coverage-url]
-[![license][license-image]](./LICENSE)
+Long-lived, secure Django sign-ins with any OpenID Connect provider. Built and tested
+against Keycloak 26.
 
-[pypi-url]: https://pypi.org/project/django-oauth2-authcodeflow/
-[dl-image]: https://img.shields.io/pypi/dm/django-oauth2-authcodeflow
-[status-image]: https://img.shields.io/pypi/status/django-oauth2-authcodeflow
-[py-image]: https://img.shields.io/pypi/pyversions/django-oauth2-authcodeflow.svg
-[django-image]: https://img.shields.io/pypi/djversions/django-oauth2-authcodeflow.svg
-[pipeline-image]: https://gitlab.com/systra/qeto/lib/django-oauth2-authcodeflow/badges/master/pipeline.svg?ignore_skipped=true
-[pipeline-url]: https://gitlab.com/systra/qeto/lib/django-oauth2-authcodeflow/-/commits/master
-[coverage-image]: https://gitlab.com/systra/qeto/lib/django-oauth2-authcodeflow/badges/master/coverage.svg
-[coverage-url]: https://gitlab.com/systra/qeto/lib/django-oauth2-authcodeflow/-/commits/master
-[license-image]: https://img.shields.io/pypi/l/django-oauth2-authcodeflow.svg
+- **Sign-in:** authorization code flow with PKCE (S256), `state` and `nonce` on every
+  sign-in. Several sign-ins can be pending at once (one per browser tab).
+- **Tokens:** kept in an encrypted database row per sign-in (`OIDCSession`), never in the
+  Django session.
+- **Refresh:** single-flight. Exactly one token call per sign-in, across threads and
+  processes (`SELECT … FOR UPDATE` on the row).
+- **Failures:** only `invalid_grant` ends a sign-in. When the provider is down or
+  misconfigured, the answer is 503 and everybody stays signed in. A circuit breaker
+  protects the provider.
+- **HTTP contract:** one contract for browsers, frames and API clients (302, 401 JSON,
+  503 JSON).
+- **Logout:** OpenID Connect Back-Channel Logout, RP-initiated logout, and optional token
+  revocation.
+- **Bearer:** access tokens for machine clients. Only asymmetric signatures are accepted,
+  and `iss`, `aud`/`azp` and `typ` are checked.
+- **Integrations:** Django REST framework and Channels, plus test helpers and a pytest
+  plugin.
 
-Authenticate with any OpenId Connect/Oauth2 provider through authorization code flow with [Django](https://www.djangoproject.com/).
+Protocols: [OAuth 2.0](https://www.rfc-editor.org/rfc/rfc6749),
+[PKCE](https://www.rfc-editor.org/rfc/rfc7636),
+[OpenID Connect Core 1.0](https://openid.net/specs/openid-connect-core-1_0.html),
+[RP-Initiated Logout 1.0](https://openid.net/specs/openid-connect-rpinitiated-1_0.html),
+[Back-Channel Logout 1.0](https://openid.net/specs/openid-connect-backchannel-1_0.html),
+[Token Revocation](https://www.rfc-editor.org/rfc/rfc7009).
 
-Supported protocols:
+Supported: Python 3.10 to 3.13; Django 4.2, 5.2 and 6.0.
 
-- [Oauth 2.0](https://www.rfc-editor.org/rfc/rfc6749)
-- [PKCE](https://www.rfc-editor.org/rfc/rfc7636)
-- [OpenIDConnect 1.0](https://openid.net/specs/openid-connect-rpinitiated-1_0.html)
+**Upgrading from 2.x:** read [UPGRADING.md](UPGRADING.md) first. Sessions migrate by
+themselves, but several defaults and answers changed.
 
-Wording
--------
 
-- OP = OpenId Connect Provider, the auth server
-- RP = Relying Party, the client, your application
+Installation
+------------
+
+```bash
+pip install 'django-oauth2-codeflow[drf,channels]'   # the extras are optional
+```
+
+This distribution provides the `oauth2_authcodeflow` package, the same name the upstream
+`django-oauth2-authcodeflow` uses. Install only one of the two; system check
+`oauth2_authcodeflow.E004` reports a conflict.
+
 
 Setup
 -----
 
-- add `oauth2_authcodeflow` to the `INSTALLED_APPS` (after `django.contrib.auth` and `django.contrib.sessions` apps)
-- add `path('oidc/', include('oauth2_authcodeflow.urls')),` in your global `urls.py` file.
+```python
+INSTALLED_APPS = [
+    # ...
+    'django.contrib.auth',
+    'django.contrib.sessions',
+    'oauth2_authcodeflow',
+]
 
-    You can change the path prefix to what you want
+AUTHENTICATION_BACKENDS = [
+    'oauth2_authcodeflow.auth.AuthenticationBackend',
+    'django.contrib.auth.backends.ModelBackend',  # only if local accounts exist too
+]
 
-- add `oauth2_authcodeflow.auth.AuthenticationBackend` to the `AUTHENTICATION_BACKENDS` config.
+MIDDLEWARE = [
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'oauth2_authcodeflow.middleware.BearerAuthMiddleware',     # optional: machine clients
+    'oauth2_authcodeflow.middleware.OIDCSessionMiddleware',
+    'oauth2_authcodeflow.middleware.LoginRequiredMiddleware',  # optional: every URL needs a sign-in
+    # ...
+]
 
-    You can keep `django.contrib.auth.backends.ModelBackend` as a second-fallback auth mechanism.
+SESSION_COOKIE_AGE = 31 * 24 * 3600  # sliding; the provider decides when a sign-in ends
 
-- get your callback urls by doing:
-```sh
-./manage.py oidc_urls [--secure] <HOST_NAME>
+OIDC_OP_DISCOVERY_DOCUMENT_URL = 'https://sso.example.com/realms/acme/.well-known/openid-configuration'
+OIDC_OP_ISSUER = 'https://sso.example.com/realms/acme'
+OIDC_RP_CLIENT_ID = 'my-app'
+OIDC_RP_CLIENT_SECRET = os.environ['OIDC_RP_CLIENT_SECRET']
+OIDC_TOKEN_ENCRYPTION_KEYS = os.environ['OIDC_TOKEN_ENCRYPTION_KEYS'].split(',')  # Fernet keys, newest first
 ```
-- Configure your application on the OpenId Connect Provider.
 
-    This should give you a `client_id` and a `secret_id`.
+```python
+# urls.py
+urlpatterns = [
+    path('oidc/', include('oauth2_authcodeflow.urls')),
+    # ...
+]
+```
 
-    You will need to fill the `redirect_url` and `logout_url` there.
+Then run `python manage.py migrate`, and `python manage.py oidc_check` to verify the
+provider. `python manage.py oidc_urls app.example.com --secure` prints the URLs to register
+on the client:
 
-- Ensue to include the `sid`, email, first name, last name (if applicable) parameters in the id token claims on the OP.
-- Ensure that `django.contrib.sessions.middleware.SessionMiddleware` is in `MIDDLEWARE`
+| Path | URL name | Purpose |
+|---|---|---|
+| `oidc/authenticate` | `oidc_authentication` | Starts a sign-in. Query: `next`, `fail`, `prompt` (`none`, `login`, `consent`, `select_account`), `login_hint`. |
+| `oidc/callback` | `oidc_callback` | The redirect URI and the post-logout redirect URI. |
+| `oidc/logout` | `oidc_logout` | Ends the local sign-in (GET or POST, `next`). |
+| `oidc/total_logout` | `oidc_total_logout` | Also ends the SSO session at the provider (RP-initiated logout with `id_token_hint`). |
+| `oidc/backchannel-logout` | `oidc_backchannel_logout` | Back-channel logout: the provider POSTs a `logout_token`. |
 
-Minimal configuration
----------------------
+`next` and `fail` must stay on the request host or on `OIDC_ALLOWED_REDIRECT_HOSTS`;
+anything else is refused with 400. When there is no `fail` URL, a failed sign-in renders a
+small page with a retry link instead of redirecting.
 
-- `SESSION_COOKIE_SECURE` to `True` if your Django is served through *HTTPS*
-- `OIDC_OP_DISCOVERY_DOCUMENT_URL` to the well-known openid configuration url of the OP
-- `OIDC_RP_CLIENT_ID` client id provided by the OP
-- `OIDC_RP_CLIENT_SECRET` secrect id provided by the OP
+The middleware order is checked (`oauth2_authcodeflow.E001`): Session, then Authentication,
+then (Bearer), then OIDCSession, then LoginRequired.
 
-Login
------
 
-Get your browser/frontend to go to the `oidc_authentication` page name (`/oidc/authenticate` by default) with the following parameters:
-
-- `next`: the url to redirect on success
-- `fail`: the url to redirect on failure, `error` query string may contain an error description
-
-Logout
-------
-
-Get your browser/frontend to go to the `oidc_logout` page name (`/oidc/logout` by default) with the following parameters:
-
-- `next`: the url to redirect on success
-- `fail`: the url to redirect on failure, `error` query string may contain an error description
-
-Logout from the OP as well
---------------------------
-
-This will logout the user from the application but also from the OP (if user say yes) and the OP should also logout the user from all other apps connected to this OP.
-
-The spec is not well followed by the OP, so you mileage may vary.
-
-Get your browser/frontend to go to the `oidc_total_logout` page name (`/oidc/total_logout` by default) with the following parameters:
-
-- `next`: the url to redirect on success
-- `fail`: the url to redirect on failure, `error` query string may contain an error description
-
-Protect your urls
+How sign-ins work
 -----------------
 
-At least three options are possible.
+1. **Sign-in.** The callback validates the ID token (signature, `iss`, `aud`, `azp`, `exp`,
+   `iat` and `nonce`, with 30 s of leeway). It provisions the user and creates an
+   `OIDCSession` row. The Django session only holds the row's id.
+   - The row keeps the encrypted access, refresh and ID tokens, `sub`, `sid`, the issuer,
+     the expiry times, and the allow-listed profile claims (`OIDC_CLAIMS_ALLOWLIST`).
+   - Signing in again in the same browser supersedes the previous row. The sign-ins of
+     other devices are left alone.
+2. **Every request.** `OIDCSessionMiddleware` loads the row and sets `request.oidc`.
+   - In `eager` mode it refreshes when the access token has less than
+     `OIDC_REFRESH_SKEW_SECONDS` left. In `lazy` mode it refreshes only when code asks for a
+     token.
+   - It slides the Django session at most once per `OIDC_SESSION_RENEW_INTERVAL_SECONDS`.
+3. **Refresh.** A refresh is single-flight: a per-process lock, then a row lock.
+   - A request whose token is still usable never waits for another refresher.
+   - Other requests wait at most `OIDC_REFRESH_WAIT_SECONDS`.
+   - When a refresh fails, the requests queued behind it get its outcome (the still-usable
+     token, else 503) instead of each calling the provider again; the process retries
+     that sign-in after `sessions.REFRESH_RETRY_GAP_SECONDS` (2).
+   - A refresh never runs inside a caller's `transaction.atomic()` block.
+4. **End.** A sign-in lasts as long as the provider's SSO session (Keycloak: *SSO Session
+   Idle* / *SSO Session Max*). `OIDC_SESSION_MAX_AGE_SECONDS` can add an absolute cap.
 
-1. Use default django way to [limit access to logged-in users](https://docs.djangoproject.com/en/4.1/topics/auth/default/#limiting-access-to-logged-in-users) by defining `LOGIN_URL` in your settings and and `login_required` decorators in your views.  
-  ```python
-  # settings.py
-  from django.urls import reverse_lazy
-  from django.utils.text import format_lazy
-  LOGIN_URL = format_lazy('{url}?fail=/', url=reverse_lazy(OIDC_URL_AUTHENTICATION_NAME))
-  # urls.py
-  from django.contrib.auth.decorators import login_required
-  path('restricted_url/', login_required(your_view)),
-  ```
-2. A slightly different version, by directly and only using the `login_required` from `oauth2_authcodeflow.utils`.
-3. Use the `LoginRequiredMiddleware` with `OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS` configuration.
+What a refresh answer means:
 
-Optional middlewares
+| Token endpoint answer | Category | Effect |
+|---|---|---|
+| 200 with an access token | ok | New tokens, `oidc_session_refreshed` |
+| `invalid_grant` | terminal | The sign-in ends (`refresh_invalid_grant`), and the request gets the "session expired" answer |
+| `invalid_grant` "Invalid token issuer …" | configuration | Sign-in kept, 503, breaker open for 300 s |
+| `invalid_client`, `unauthorized_client`, `unsupported_grant_type`, `invalid_scope`, `invalid_request` | configuration | Sign-in kept, 503, breaker open for 300 s |
+| 429, 5xx, HTML pages, timeouts, connection errors, 200 without a token | transient | Sign-in kept; a still-usable token is served, otherwise 503 |
+
+The circuit breaker opens after 5 failures in 30 s and stays open for 15 s. After that, one
+probe call is let through. Configure it with `OIDC_CIRCUIT_BREAKER`. While it is open, no
+request calls the provider.
+
+
+The HTTP contract
+-----------------
+
+| Request kind | Recognised by | No sign-in | Sign-in ended | Provider unavailable |
+|---|---|---|---|---|
+| Navigation | GET with `Sec-Fetch-Mode: navigate`, or `Accept: text/html` without fetch metadata | 302 to `oidc/authenticate?next=…` | Same, after signing out | 503 HTML page that retries |
+| Frame | `Sec-Fetch-Dest: iframe` (or `frame`, `embed`, `object`) | 401 HTML with a link that signs in in the top window | Same | 503 HTML |
+| API | Anything else: fetch/XHR, `OIDC_API_URL_PATTERNS` (`^/api/`), non-GET, `Authorization` header | 401 `{"error": "not_authenticated", "login_url": …}` | 401 `{"error": "session_expired", "login_url": …}` | 503 `{"error": "auth_unavailable", "retry_after": n}` |
+
+Every answer carries `Cache-Control: no-store`. A 401 carries `WWW-Authenticate`
+(`Session realm="<client id>"`, or `Bearer error="invalid_token"` for a rejected bearer
+token), and a 503 carries `Retry-After`. Anonymous requests never touch a pending sign-in.
+Set `OIDC_NAVIGATION_REDIRECT = False` to answer navigations with 401 instead of a redirect.
+
+
+Using the sign-in in code
+-------------------------
+
+```python
+from oauth2_authcodeflow.tokens import get_access_token, get_id_claims
+
+def view(request):
+    token = get_access_token(request, min_ttl=60)  # refreshed if needed; None without an OIDC sign-in
+    claims = get_id_claims(request)                # allow-listed profile claims
+    roles = request.oidc.client_roles()            # resource_access[<client id>].roles
+```
+
+- `get_access_token` raises `OIDCSessionEnded` (answered 401) or `OIDCAuthUnavailable`
+  (answered 503). The middleware maps both to the contract.
+- Background code uses `oauth2_authcodeflow.sessions.access_token_for(session_id, min_ttl=0)`.
+  Like a request, it returns a still-usable token at once while another thread refreshes;
+  `wait=True` waits for that refresh, at most `OIDC_REFRESH_WAIT_SECONDS`.
+- `oauth2_authcodeflow.utils.login_required` is Django's decorator, pointed at the OIDC
+  sign-in.
+
+**Signals** (`oauth2_authcodeflow.signals`):
+
+| Signal | Arguments |
+|---|---|
+| `oidc_session_started` | `session`, `request` |
+| `oidc_session_refreshed` | `session` |
+| `oidc_session_refresh_failed` | `session`, `category`, `status`, `oauth_error` |
+| `oidc_session_ended` | `session`, `reason` |
+| `oidc_backchannel_logout_received` | `issuer`, `sid`, `sub`, `matched` |
+
+**Events.** These go to the `oauth2_authcodeflow.events` logger as `event=<name> key=value`
+lines, with tokens redacted: `oidc.session.started`, `.refreshed`, `.ended`,
+`oidc.login.failed`, `oidc.backchannel_logout`, `oidc.circuit.opened` and `.closed`,
+`oidc.config.issuer_mismatch`, `oidc.discovery.failed` and `.stale`.
+
+
+Bearer tokens
+-------------
+
+`BearerAuthMiddleware` authenticates `Authorization: Bearer <access token>` without a
+session.
+
+- Only access tokens are accepted: `typ` must be `Bearer`, so an ID token is refused.
+- The signature must be asymmetric (`OIDC_RP_SIGN_ALGOS_ALLOWED`); HS* and `none` are never
+  accepted, whatever the setting says.
+- `iss` must be `OIDC_OP_ISSUER`.
+- `aud` must contain `OIDC_BEARER_AUDIENCES` (default: the client id). Alternatively, `azp`
+  must be the client id when `OIDC_BEARER_ACCEPT_AZP = True`.
+
+Other `Authorization` schemes are ignored.
+
+
+Django REST framework
+---------------------
+
+```python
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'oauth2_authcodeflow.contrib.drf.OIDCBearerAuthentication',
+        'oauth2_authcodeflow.contrib.drf.OIDCSessionAuthentication',
+    ],
+    'EXCEPTION_HANDLER': 'oauth2_authcodeflow.contrib.drf.oidc_exception_handler',
+}
+```
+
+- Unauthenticated requests get 401 (not 403) with a `WWW-Authenticate` header.
+- Error bodies carry a `code`: `not_authenticated`, `permission_denied` or `csrf_failed`.
+- Library exceptions follow the contract: 401 `session_expired`, 503 `auth_unavailable`.
+
+
+Channels
+--------
+
+```python
+application = AuthMiddlewareStack(OIDCSessionASGIMiddleware(URLRouter(routes)))
+
+class Consumer(OIDCSessionConsumerMixin, AsyncWebsocketConsumer):
+    async def connect(self):
+        if await self.oidc_connect():
+            await self.accept()
+
+    async def disconnect(self, code):
+        await self.oidc_disconnect()
+```
+
+- Without a sign-in, the socket is accepted, then closed with code 4401.
+- When the sign-in ends (logout, back-channel logout, `invalid_grant`), its sockets are
+  closed with 4401 through a channel-layer group.
+- Sockets also check the sign-in again every `oidc_revalidate_seconds` (300 by default).
+- Synchronous consumers use `SyncOIDCSessionConsumerMixin`.
+
+
+Keycloak client
+---------------
+
+| Client setting | Value |
+|---|---|
+| Client authentication | On (confidential). Public clients set `OIDC_RP_CLIENT_SECRET = ''` and rely on PKCE. |
+| Valid redirect URIs | `https://app.example.com/oidc/callback` |
+| Valid post logout redirect URIs (`post.logout.redirect.uris`) | `https://app.example.com/oidc/callback` |
+| PKCE method (`pkce.code.challenge.method`) | `S256` |
+| Back-channel logout URL (`backchannel.logout.url`) | `https://app.example.com/oidc/backchannel-logout`, reachable from Keycloak |
+| Back-channel logout session required (`backchannel.logout.session.required`) | On |
+| Front channel logout | Off |
+| Audience mapper | Add the client id to access tokens, if bearer tokens are used |
+
+Session policy lives in the realm, not in the app:
+
+- *SSO Session Idle* and *SSO Session Max* decide how long people stay signed in. The
+  reference policy is 30 days idle and 90 days max for application realms.
+- Keep *Client Session Idle/Max* unset or at least as long.
+- Keep *Revoke Refresh Token* off unless every client handles rotation.
+- `SESSION_COOKIE_AGE` must be at least as long as the idle timeout: 31 days, sliding
+  (warning `oauth2_authcodeflow.W003`).
+
+**Internal URL.** The app can reach Keycloak through an internal URL (for example a cluster
+Service) while users see the public one:
+
+- Set `OIDC_OP_DISCOVERY_DOCUMENT_URL` to the internal URL.
+- Set `OIDC_OP_ISSUER` to the public issuer.
+- Keycloak must be started with `--hostname=https://sso.example.com` and
+  `--hostname-backchannel-dynamic=true`. Its discovery document then keeps the public
+  issuer while the token, JWKS and userinfo endpoints use the internal URL.
+- Without these options, Keycloak answers refreshes with `invalid_grant` "Invalid token
+  issuer". The library treats that as a configuration error (503, nobody signed out).
+- Error `oauth2_authcodeflow.E003` flags an internal discovery host without
+  `OIDC_OP_ISSUER`.
+
+
+Settings
+--------
+
+Only `OIDC_RP_CLIENT_ID`, `OIDC_RP_CLIENT_SECRET` and the provider location are required.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `OIDC_OP_DISCOVERY_DOCUMENT_URL` | — | Discovery document. The app may use an internal URL. |
+| `OIDC_OP_ISSUER` | discovery `issuer` | Public issuer. Must equal the discovery document's `issuer` (a mismatch is a configuration error). |
+| `OIDC_OP_AUTHORIZATION_URL`, `_TOKEN_URL`, `_USERINFO_URL`, `_JWKS_URL`, `_END_SESSION_URL`, `_REVOCATION_URL` | discovery | Explicit endpoints, applied on top of discovery. |
+| `OIDC_OP_FETCH_USER_INFO` | `True` | Merge userinfo claims at sign-in (when `sub` matches). |
+| `OIDC_OP_TOTAL_LOGOUT` | `True` | `total_logout` also ends the SSO session. |
+| `OIDC_RP_CLIENT_AUTH_METHOD` | `client_secret_post`, or `none` without a secret | `client_secret_post`, `client_secret_basic` or `none`. |
+| `OIDC_RP_USE_PKCE` | `True` | PKCE S256. |
+| `OIDC_RP_SCOPES` | `['openid', 'email', 'profile']` | Requested scopes. |
+| `OIDC_RP_SIGN_ALGOS_ALLOWED` | `['RS256', 'PS256', 'ES256']` | Accepted signature algorithms. Symmetric ones are refused (E002). |
+| `OIDC_RP_IDP_SIGN_KEY` | `None` | Static public key (PEM) instead of JWKS. |
+| `OIDC_ALLOWED_REDIRECT_HOSTS` | `[]` | Extra hosts allowed for `next` and `fail`. |
+| `OIDC_LOGIN_STATE_TTL_SECONDS` / `OIDC_LOGIN_MAX_PENDING` | `600` / `5` | Pending sign-ins per browser. |
+| `OIDC_CREATE_USER` | `True` | Create unknown users at sign-in. |
+| `OIDC_UNUSABLE_PASSWORD` | `False` | Make the password unusable at every sign-in. New users always get an unusable password. |
+| `OIDC_DJANGO_USERNAME_FUNC`, `OIDC_EMAIL_CLAIM`, `OIDC_FIRSTNAME_CLAIM`, `OIDC_LASTNAME_CLAIM`, `OIDC_EXTEND_USER` | as in 2.x | User provisioning hooks. |
+| `OIDC_CLAIMS_ALLOWLIST` | profile claims | Claims kept on the row (`'*'` keeps all; tokens are never kept here). |
+| `OIDC_HTTP_TIMEOUT` | `(3.05, 8)` | Connect and read timeout of every call to the provider. |
+| `OIDC_CA_BUNDLE` / `OIDC_PROXY` | `True` / `None` | TLS verification and proxies for provider calls. |
+| `OIDC_REFRESH_MODE` | `'eager'` | `eager` refreshes in the middleware; `lazy` refreshes only in `get_access_token`. |
+| `OIDC_REFRESH_SKEW_SECONDS` | `60` | Refresh when less than this is left. |
+| `OIDC_REFRESH_WAIT_SECONDS` | `10` | Longest wait for another refresher (and the Postgres `lock_timeout`). |
+| `OIDC_CIRCUIT_BREAKER` | `{'failures': 5, 'window': 30, 'cooldown': 15, 'config_cooldown': 300}` | Per-process breaker in front of the token endpoint. |
+| `OIDC_SESSION_RENEW_INTERVAL_SECONDS` | `3600` | How often the Django session slides. |
+| `OIDC_SESSION_MAX_AGE_SECONDS` | `None` | Optional absolute cap on a sign-in. |
+| `OIDC_TOKEN_ENCRYPTION_KEYS` | derived from `SECRET_KEY` | Fernet keys, newest first. Without them, keys are derived from `SECRET_KEY` and `SECRET_KEY_FALLBACKS` (warning W001 outside DEBUG). The derived keys always stay as decrypt-only fallbacks, so setting explicit keys later keeps every sign-in; `oidc_rotate_keys` then moves the tokens onto the first key. |
+| `OIDC_LEGACY_SESSION_MIGRATION` | `True` | Move 2.x session tokens into a row on their first request. |
+| `OIDC_LOGIN_REQUIRED_EXEMPT_URL_PATTERNS` | `[]` | Regexes `LoginRequiredMiddleware` lets through. Anchor them (W002). |
+| `OIDC_SESSION_EXEMPT_URL_PATTERNS` | `[]` | Regexes `OIDCSessionMiddleware` skips (health checks). |
+| `OIDC_API_URL_PATTERNS` | `['^/api/']` | Paths that always get API answers. |
+| `OIDC_NAVIGATION_REDIRECT` | `True` | Redirect unauthenticated navigations to the sign-in. |
+| `OIDC_BEARER_AUDIENCES` / `OIDC_BEARER_ACCEPT_AZP` | client id / `False` | Bearer audience rules. |
+| `OIDC_REVOKE_ON_LOGOUT` | `False` | Revoke the refresh token on `logout` and `total_logout`. |
+| `OIDC_BACKCHANNEL_LOGOUT_ENABLED` | `True` | Serve the back-channel logout endpoint. |
+| `OIDC_BACKCHANNEL_LOGOUT_MAX_AGE_SECONDS` | `300` | Accepted age of a `logout_token`. |
+| `OIDC_CACHE_ALIAS` | `'default'` | Cache for the `logout_token` replay check (`jti`). |
+| `OIDC_CHANNELS_NOTIFY` | `'auto'` | `off` disables socket notifications. |
+
+Renamed and removed settings are listed in [UPGRADING.md](UPGRADING.md). Old names keep
+working, with a `DeprecationWarning`.
+
+
+Operations
+----------
+
+**Commands:**
+
+| Command | Purpose |
+|---|---|
+| `oidc_check [--json]` | Checks discovery, issuer, JWKS and token endpoint reachability. |
+| `oidc_urls <host> [--secure]` | Prints the redirect, post-logout and back-channel URLs. |
+| `oidc_cleanup [--ended-older-than DAYS] [--dry-run]` | Ends expired and orphaned rows, deletes old ended rows, and purges the 2.x blacklist. Run it daily. |
+| `oidc_rotate_keys [--batch-size N] [--end-undecryptable]` | Re-encrypts every row with the newest key, after adding one to `OIDC_TOKEN_ENCRYPTION_KEYS` (also the first time, when the tokens were written with the derived key). |
+
+**System checks:**
+
+| Id | Check |
+|---|---|
+| E001 | Middleware order |
+| E002 | Symmetric algorithms configured |
+| E003 | Internal discovery host without `OIDC_OP_ISSUER` |
+| E004 | The upstream distribution is also installed |
+| W001 | Derived encryption keys outside DEBUG |
+| W002 | Unanchored exempt patterns |
+| W003 | `SESSION_COOKIE_AGE` under 30 days |
+
+**Admin.** Sign-ins are read-only in the admin (no tokens shown), with an action that ends
+the selected ones.
+
+
+Testing your project
 --------------------
 
-You can add some middlewares to add some features:
+```python
+from oauth2_authcodeflow.testing import create_oidc_session
 
-- `oauth2_authcodeflow.middleware.LoginRequiredMiddleware` to automaticaly force a login request to urls not in `OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS` if not authenticated.
-- `oauth2_authcodeflow.middleware.RefreshAccessTokenMiddleware` to automaticaly refresh the access token when it’s expired.
-- `oauth2_authcodeflow.middleware.RefreshSessionMiddleware` to automaticaly ask for a new id token when it’s considered expired.
-- `oauth2_authcodeflow.middleware.BearerAuthMiddleware` to authenticate the user using `Authorization` HTTP header (API, scripts, CLI usage).
+def test_dashboard(client, django_user_model):
+    user = django_user_model.objects.create_user('alice')
+    create_oidc_session(client, user, client_roles=['admin'])
+    assert client.get('/dashboard/').status_code == 200
+```
 
-`LoginRequiredMiddleware` will refresh to the original page uppon user logged-in.
+- `create_oidc_session(client_or_request, user, *, client_roles=None, claims=None,
+  access_expires_in=300, refresh=True, **access_claims)` signs a user in without a
+  provider. It works with a test `Client` or an `HttpRequest`.
+- The pytest fixture `oidc_op` (loaded through the `pytest11` entry point) installs
+  `FakeOP`, an in-process provider. It covers discovery, JWKS, token, userinfo and
+  revocation, and the token endpoint's answers can be scripted:
+  `oidc_op.script_token((400, {'error': 'invalid_grant'}))`.
+- `make_signed_token(claims)` signs tokens with the key `FakeOP` publishes.
 
-`RefreshAccessTokenMiddleware` and `RefreshSessionMiddleware` will try the refresh and return a redirect to the same page (or the one configured as next in the login phase) if the refresh cannot happen.
 
-Use them to silently refresh your access/id tokens.
+Developing this library
+-----------------------
 
-BearerAuthMiddleware will use `oauth2_authcodeflow.auth.BearerAuthenticationBackend` to authenticate the user based on `Authorization` HTTP header instead of using the sessions.
+```bash
+poetry install --with dev,typing --all-extras
+poetry run pytest test                                                    # unit tests (SQLite)
+PGHOST=/tmp PGUSER=postgres poetry run pytest test/pg -m postgres --ds=test.pg.settings_pg
+poetry run pytest test/keycloak -m keycloak --ds=test.keycloak.settings_kc  # starts Keycloak 26 in Docker
+poetry run flake8 oauth2_authcodeflow test && poetry run mypy oauth2_authcodeflow
+```
 
-Use this to allow to authenticate without cookies/session. You then need to login with `from_cli=1` in your `login` url. You then needs to go to the displayed url with a browser and copy the result http header to make further requests.
-
-Signals
--------
-
-One can use Django `user_logged_in` and `user_logged_out` [signals](https://docs.djangoproject.com/en/5.0/ref/contrib/auth/#module-django.contrib.auth.signals) to know and act when a user is logged in or disconnected.
-
-Full configuration
-------------------
-Secure session cookie settings:
-
-- `SESSION_COOKIE_AGE` to a reasonable time (default 2 weeks)
-- `SESSION_COOKIE_HTTPONLY` **must** be `True` (default `True`)
-- `SESSION_COOKIE_PATH` be sure to use `/` to prevent some weird behavior (default `/`)
-- `SESSION_COOKIE_SAMESITE` **should** be `Lax` (default `Lax`)
-- `SESSION_COOKIE_SECURE` **should** be `True` in *https* context (default `False`)
-
-Specific OIDC settings:
-
-| Settings | Description | Default |
-| -------- | ----------- | ------- |
-| `OIDC_OP_DISCOVERY_DOCUMENT_URL` | URL of your OpenID connect Provider discovery document url (*recommended*).<br>If you provide this, the following configs will be ignored:<br>- `OIDC_OP_AUTHORIZATION_URL`<br>- `OIDC_OP_TOKEN_URL`<br>- `OIDC_OP_USERINFO_URL`<br>- `OIDC_OP_JWKS_URL` | `None` |
-| `OIDC_OP_AUTHORIZATION_URL` | URL of your OpenID connect Provider authorization endpoint (**not recommended**, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred). | `None` |
-| `OIDC_OP_TOKEN_URL` | URL of your OpenID connect Provider token endpoint (**not recommended**, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred). | `None` |
-| `OIDC_OP_USERINFO_URL` | URL of your OpenID connect Provider userinfo endpoint (**not recommended**, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred). | `None` |
-| `OIDC_OP_JWKS_URL` | URL of your OpenId connect Provider endpoint to get public signing keys (in `PEM` or `DER` format).<br>This is used to verify the `id_token`.<br>This is **not recommended** to provide this url here but rather use `OIDC_OP_DISCOVERY_DOCUMENT_URL` config. | `None` |
-| `OIDC_OP_END_SESSION_URL` | URL of your OpenID connect Provider end session endpoint (not recommended, `OIDC_OP_DISCOVERY_DOCUMENT_URL` is preferred). | `None` |
-| `OIDC_OP_FETCH_USER_INFO` | Fetch user info on login or not. | `True` |
-| `OIDC_OP_TOTAL_LOGOUT` | Do a call to total logout will call the OP for a logout. Default true.<br>Be careful, some OP will not follow the RFC and will not allow the user to NOT logout all connected apps.<br>Azure is such a bad example. | `True` |
-| `OIDC_OP_EXPECTED_EMAIL_CLAIM` | expected email key. | `'email'` |
-| `OIDC_OP_EXPECTED_CLAIMS` | `OIDC_OP_EXPECTED_EMAIL_CLAIM` value is automatically included in this list. | `[]` |
-| `OIDC_RP_CLIENT_ID` | OpenID Connect client ID provided for your Relaying Party/client by your OpenIdConnect Provider | |
-| `OIDC_RP_CLIENT_SECRET` | OpenID Connect client secret provided for your Relaying Party/client by your OpenIdConnect Provider.<br>Could be empty in PKCE case. | |
-| `OIDC_RP_USE_PKCE` | `PKCE` improve security, disable it only if your provider cannot handle it. | `True` |
-| `OIDC_RP_FORCE_SECRET_WITH_PKCE` | Force to send the client secret even when using `PKCE`.<br>Only use this option if your provider don’t support PKCE without secret. | `False` |
-| `OIDC_RP_FORCE_CONSENT_PROMPT` | Force to ask for consent on login, even if `offline_access` is not in scopes | `False` |
-| `OIDC_RP_AZURE_SPA` | Azure require the 'Origin' header when using PKCE and SPA | `False` |
-| `OIDC_RP_SCOPES` | The OpenID Connect scopes to request during login.<br>The scopes could be usefull later to get access to other ressources.<br>`openid` must be in the list.<br>You can also include the `email` scope to ensure that the email field will be in the claims (*recommended*).<br>You can also include the `profile` scope to get more (like names, …) info in the `id_token` (*recommended*).<br>You can also get a `refresh_token` by specifying the `offline_access` scope. | `['openid', 'email', 'profile', 'offline_access']` |
-| `OIDC_RP_USERINFO_CLAIMS` | OpenID Connect authorization [request parameter `userinfo` member](https://openid.net/specs/openid-connect-core-1_0.html#ClaimsParameter) to optionaly add to id token request (dict type). | `None` |
-| `OIDC_RP_TOKEN_CLAIMS` | OpenID Connect authorization [request parameter `id_token` member](https://openid.net/specs/openid-connect-core-1_0.html#ClaimsParameter) to optionaly add to id token request (dict type). | `None` |
-| `OIDC_RP_SIGN_ALGOS_ALLOWED` | Sets the algorithms the IdP may use to sign ID tokens.<br>Asymmetric only by default; the public keys come from `OIDC_RP_IDP_SIGN_KEY` or the OP JWKS (RSA and EC keys).<br>`HS256`/`HS384`/`HS512` (keyed by the client secret) must be listed explicitly: anyone holding the client secret could otherwise forge tokens. | `['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512']` |
-| `OIDC_RP_IDP_SIGN_KEY` | Public RSA used to verify signatures. Overrides keys from JWKS endpoint.<br>Should be in `PEM` or `DER` format. | `None` |
-| `OIDC_CREATE_USER` | Enables or disables automatic user creation during authentication | `True` |
-| `OIDC_RANDOM_SIZE` | Sets the length of the random string used in the OAuth2 protocol. | `32` |
-| `OIDC_PROXY` | Defines a proxy for all requests to the OpenID Connect provider (fetch JWS, retrieve JWT tokens, Userinfo Endpoint).<br>The default is set to `None` which means the library will not use a proxy and connect directly.<br>For configuring a proxy check the Python requests documentation: <https://requests.readthedocs.io/en/master/user/advanced/#proxies> | `None` |
-| `OIDC_TIMEOUT` | Timeout of every request to the OpenID Connect provider (discovery, JWKS, token, refresh, userinfo).<br>Seconds (int or float) or a `(connect, read)` tuple, see Python requests: <https://requests.readthedocs.io/en/master/user/quickstart/#timeouts> | `10` |
-| `OIDC_REDIRECT_OK_FIELD_NAME` | Sets the GET parameter that is being used to define the redirect URL after succesful authentication | `'next'` |
-| `OIDC_REDIRECT_ERROR_FIELD_NAME` | Sets the GET parameter that is being used to define the redirect URL after failed authentication | `'fail'` |
-| `OIDC_DJANGO_USERNAME_FUNC` | Function or dotted path to a function that compute the django username based on claims.<br>The username should be unique for this app.<br>The default is to use a base64 url encode of the email hash (sha1). | `get_default_django_username` |
-| `OIDC_EMAIL_CLAIM` | Claim name for email<br>`None` value means use `OIDC_OP_EXPECTED_EMAIL_CLAIM` value<br>You can also provide a lambda that takes all the claims as argument and return an email | `None` |
-| `OIDC_FIRSTNAME_CLAIM` | You can also provide a lambda that takes all the claims as argument and return a firstname | `'given_name'` |
-| `OIDC_LASTNAME_CLAIM` | You can also provide a lambda that takes all the claims as argument and return a lastname | `'family_name'` |
-| `OIDC_EXTEND_USER` | Callable that takes the `user`, the `claims` and optionaly the `request` and `access_token` as arguments and that can extend user properties.<br>You can also specify a dotted path to a callable. | `None` |
-| `OIDC_UNUSABLE_PASSWORD` | Scramble the password on each SSO connection/renewal.<br>If `False`, the password is only made unusable when the account is created. `True` changes the password hash at every login, which logs the user out of their other Django sessions. | `False` |
-| `OIDC_BLACKLIST_TOKEN_TIMEOUT_SECONDS` | 7 days by default | `7 * 86400` |
-| `OIDC_AUTHORIZATION_HEADER_PREFIX` | Only used when using authorization in header:<br>`Authorization: Bearer id_token`<br>This is only possible if `oauth2_authcodeflow.middleware.BearerAuthMiddleware` has been added to `MIDDLEWARE` setting list. | `'Bearer'` |
-| `OIDC_MIDDLEWARE_NO_AUTH_URL_PATTERNS` | The `RefreshAccessTokenMiddleware` and `RefreshSessionMiddleware` will use this list to bypass auth checks.<br>Any url listed here will not be tried to be authenticated using Auth Code Flow.<br>You should include at least any failure/error or admin urls in it. | `[]` |
-| `OIDC_MIDDLEWARE_LOGIN_REQUIRED_REDIRECT` | Redirect to login page if not authenticated when using `LoginRequiredMiddleware`. | `True` |
-| `OIDC_MIDDLEWARE_API_URL_PATTERNS` | The `RefreshAccessTokenMiddleware` and `RefreshSessionMiddleware` will use this list to answer JSON response in case of refresh failure.<br>Expected list of regexp URL patterns. | `['^/api/']` |
-| `OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS` | Idle timeout of the Django side of the session, moved forward on every successful token refresh | `7 * 86400` |
-| `OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS` | URL patterns on which the session is neither checked nor refreshed | `[]` |
-| `OIDC_REFRESH_SKEW_SECONDS` | Refresh the access token this many seconds before it expires, so an OP hiccup can be served with the current token | `30` |
-| `OIDC_RETRY_AFTER_SECONDS` | `Retry-After` of the 503 answered when the OP cannot be reached and the access token has expired | `5` |
-| `OIDC_REFRESH_LOCK_CACHE_ALIAS` | Django cache alias of the cross-process refresh lock. Unset: `redis` when `DEPLOYMENT_ENVIRONMENT` is set, else `local`, falling back to `default` | `None` |
-
-## Failure handling (2.1)
-
-- Only an `invalid_grant` answer to a refresh ends the session (forced logout, logged at WARNING with its reason).
-- Any other refresh failure keeps the session: the still valid access token is served, otherwise `503` with
-  `Retry-After` is answered — JSON `{"error": "auth_unavailable", "retry_after": N}` for API/fetch requests,
-  a self-retrying page for navigations.
-- Requests needing a (new) login: page navigations are redirected to the login, fetch/XHR/API requests get
-  `401` JSON `{"error": "not_authenticated" | "session_expired", "login_url": "..."}` with `WWW-Authenticate`
-  and `Cache-Control: no-store`. Anonymous sessions are never destroyed.
+The Postgres suite exercises row locking, which SQLite ignores. The Keycloak suite starts
+the `kc-codeflow-3` container on 127.0.0.1:18080 and removes it afterwards.
