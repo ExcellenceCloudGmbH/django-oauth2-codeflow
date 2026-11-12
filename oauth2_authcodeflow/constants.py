@@ -23,3 +23,5 @@ OIDC_URL_TOTAL_LOGOUT_NAME = 'oidc_total_logout'
 OIDC_URL_LOGOUT_BY_OP_NAME = 'oidc_logout_by_op'
 OIDC_FROM_CLI_QUERY_STRING = 'from_cli'
 OIDC_CLAIMS_PARAMETER_SUPPORTED = 'claims_parameter_supported'
+# A session written by the 3.0 layout (tokens in an OIDCSession row): 2.1 must not treat it as its own
+SESSION_OIDC3_ID = '_oidc_session_id'

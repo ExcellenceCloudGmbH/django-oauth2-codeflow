@@ -66,3 +66,31 @@ def test_Settings_default(settings):
 
 def test_settings():
     assert isinstance(settings, Settings)
+
+
+def test_bridge_2_1_defaults(settings):
+    """2.1 secure defaults (plan §6.1): no symmetric algorithms, no password scrambling, bounded OP calls."""
+    from oauth2_authcodeflow.conf import DEFAULTS
+    assert DEFAULTS['OIDC_RP_SIGN_ALGOS_ALLOWED'][1] == ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512']
+    assert not any(algo.startswith('HS') for algo in DEFAULTS['OIDC_RP_SIGN_ALGOS_ALLOWED'][1])
+    assert DEFAULTS['OIDC_UNUSABLE_PASSWORD'][1] is False
+    assert DEFAULTS['OIDC_TIMEOUT'][1] == 10
+    assert DEFAULTS['OIDC_REFRESH_SKEW_SECONDS'][1] == 30
+    assert DEFAULTS['OIDC_RETRY_AFTER_SECONDS'][1] == 5
+    assert DEFAULTS['OIDC_REFRESH_LOCK_CACHE_ALIAS'][1] is None
+    assert DEFAULTS['OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS'][1] == []
+    for name in ('OIDC_RP_SIGN_ALGOS_ALLOWED', 'OIDC_UNUSABLE_PASSWORD', 'OIDC_TIMEOUT'):
+        if hasattr(settings, name):
+            delattr(settings, name)
+    assert settings_value('OIDC_UNUSABLE_PASSWORD') is False
+    assert settings_value('OIDC_TIMEOUT') == 10
+    # a (connect, read) tuple and a float are valid timeouts
+    settings.OIDC_TIMEOUT = (3.05, 8)
+    assert settings_value('OIDC_TIMEOUT') == (3.05, 8)
+    settings.OIDC_TIMEOUT = 2.5
+    assert settings_value('OIDC_TIMEOUT') == 2.5
+
+
+def settings_value(name):
+    from oauth2_authcodeflow.conf import Settings
+    return getattr(Settings(), name)

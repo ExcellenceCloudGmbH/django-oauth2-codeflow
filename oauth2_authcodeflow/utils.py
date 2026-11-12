@@ -21,6 +21,19 @@ from .conf import (
 _VIEW = TypeVar("_VIEW", bound=Callable[..., HttpResponseBase])
 
 
+def op_request_kwargs() -> Dict[str, Any]:
+    """Keyword arguments for every HTTP call to the OpenID Connect provider: `OIDC_TIMEOUT` and `OIDC_PROXY`."""
+    kwargs: Dict[str, Any] = {'timeout': settings.OIDC_TIMEOUT}
+    if settings.OIDC_PROXY:
+        kwargs['proxies'] = settings.OIDC_PROXY
+    return kwargs
+
+
+def is_signing_jwk(key: Dict[str, Any]) -> bool:
+    """RSA and EC public keys meant for signatures (a JWK without `use` is accepted for any purpose)."""
+    return key.get('kty') in ('RSA', 'EC') and key.get('use', 'sig') == 'sig' and 'kid' in key
+
+
 class OIDCUrlsMixin:
     def get_oidc_urls(self, session: Dict[str, Any]) -> Dict[str, Any]:
         session = dict(session.items())  # .copy() is not available on SessionStore
@@ -33,7 +46,7 @@ class OIDCUrlsMixin:
                 constants.SESSION_OP_END_SESSION_URL not in session,
                 constants.SESSION_OP_CLAIMS_PARAMETER_SUPPORTED not in session,
             )):
-                doc_resp = request_get(settings.OIDC_OP_DISCOVERY_DOCUMENT_URL)
+                doc_resp = request_get(settings.OIDC_OP_DISCOVERY_DOCUMENT_URL, **op_request_kwargs())
                 doc_resp.raise_for_status()
                 doc = doc_resp.json()
                 session[constants.SESSION_OP_AUTHORIZATION_URL] = doc.get('authorization_endpoint')
@@ -63,12 +76,12 @@ class OIDCUrlsMixin:
                 raise ImproperlyConfigured(f'OIDC_{conf} is undefined')
         if not session.get(constants.SESSION_OP_JWKS):
             if session.get(constants.SESSION_OP_JWKS_URL):
-                jwks_resp = request_get(str(session[constants.SESSION_OP_JWKS_URL]))
+                jwks_resp = request_get(str(session[constants.SESSION_OP_JWKS_URL]), **op_request_kwargs())
                 jwks_resp.raise_for_status()
                 jwks = jwks_resp.json()['keys']
             else:
                 jwks = []
-            session[constants.SESSION_OP_JWKS] = {key['kid']: key for key in jwks if key['kty'] == 'RSA' and key['use'] == 'sig'}
+            session[constants.SESSION_OP_JWKS] = {key['kid']: key for key in jwks if is_signing_jwk(key)}
         return session
 
 

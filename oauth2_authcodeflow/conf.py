@@ -93,9 +93,10 @@ DEFAULTS: Dict[str, Tuple[Any, Any]] = {
     # OpenID Connect authorization request parameter `id_token` dict to add to id token request.
     'OIDC_RP_TOKEN_CLAIMS': (dict, None),
     # Sets the algorithms the IdP may use to sign ID tokens.
-    # Typical values ar 'HS256' (no key required) and 'RS256' (public key required)
-    # The public keys might be defined in `OIDC_RP_IDP_SIGN_KEY` or deduced using the `OIDC_OP_JWKS_URL` config.
-    'OIDC_RP_SIGN_ALGOS_ALLOWED': (list, ['HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512']),
+    # Asymmetric algorithms only by default: the public keys come from `OIDC_RP_IDP_SIGN_KEY` or the OP JWKS.
+    # 'HS256'/'HS384'/'HS512' (signed with the client secret) are still supported but must be listed explicitly:
+    # anyone holding the client secret could otherwise forge tokens.
+    'OIDC_RP_SIGN_ALGOS_ALLOWED': (list, ['RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512']),
     # Public RSA used to verify signatures. Overrides keys from JWKS endpoint.
     # Should be in PEM or DER format.
     'OIDC_RP_IDP_SIGN_KEY': (bytes, None),
@@ -107,11 +108,10 @@ DEFAULTS: Dict[str, Tuple[Any, Any]] = {
     # The default is set to None which means the library will not use a proxy and connect directly.
     # For configuring a proxy check the Python requests documentation: https://requests.readthedocs.io/en/master/user/advanced/#proxies
     'OIDC_PROXY': (dict, None),
-    # Defines a timeout for all requests to the OpenID Connect provider (fetch JWS, retrieve JWT tokens, Userinfo Endpoint).
-    # The default is set to None which means the library will wait indefinitely.
-    # The time can be defined as seconds (integer).
-    # More information about possible configuration values, see Python requests: https://requests.readthedocs.io/en/master/user/quickstart/#timeouts
-    'OIDC_TIMEOUT': (int, None),
+    # Defines a timeout for all requests to the OpenID Connect provider (discovery, JWKS, token, refresh, userinfo).
+    # Seconds (int or float) or a (connect, read) tuple, see Python requests:
+    # https://requests.readthedocs.io/en/master/user/quickstart/#timeouts
+    'OIDC_TIMEOUT': ((int, float, tuple), 10),
     # Sets the GET parameter that is being used to define the redirect URL after succesful authentication
     'OIDC_REDIRECT_OK_FIELD_NAME': (str, 'next'),
     # Sets the GET parameter that is being used to define the redirect URL after failed authentication
@@ -131,8 +131,9 @@ DEFAULTS: Dict[str, Tuple[Any, Any]] = {
     # to extend user with other potential additional information available in the claims or from another request
     # You can also specify a dotted path to a callable
     'OIDC_EXTEND_USER': (FunctionType, None),
-    # Scramble the password on each SSO connection/renewal. If False, it will only scramble it when creating an account.
-    'OIDC_UNUSABLE_PASSWORD': (bool, True),
+    # Scramble the password on each SSO connection/renewal. If False (default), it is only made unusable when the account is created.
+    # True changes the password hash at every login, which invalidates the user's other Django sessions (other browsers, devices).
+    'OIDC_UNUSABLE_PASSWORD': (bool, False),
     'OIDC_BLACKLIST_TOKEN_TIMEOUT_SECONDS': (int, 7 * 86400),  # 7 days
     # Only used when using authorization in header:
     #   Authorization: Bearer id_token
@@ -147,7 +148,18 @@ DEFAULTS: Dict[str, Tuple[Any, Any]] = {
     # The RefreshAccessTokenMiddleware and RefreshSessionMiddleware will use this list to answer JSON response in case of refresh failure.
     # Expected list of regexp URL patterns.
     'OIDC_MIDDLEWARE_API_URL_PATTERNS': (list, ['^/api/']),
+    # Idle timeout of the Django side of the session: moved forward on every successful token refresh.
     'OIDC_MIDDLEWARE_SESSION_TIMEOUT_SECONDS': (int, 7 * 86400),  # 7 days
+    # The RefreshAccessTokenMiddleware and RefreshSessionMiddleware do not refresh or check the session on these URL patterns.
+    'OIDC_MIDDLEWARE_NO_REFRESH_URL_PATTERNS': (list, []),
+    # Refresh the access token this many seconds before it expires, so a transient OP failure can still be served
+    # with the current token instead of an error.
+    'OIDC_REFRESH_SKEW_SECONDS': (int, 30),
+    # `Retry-After` (seconds) sent with the 503 answered when the OP is unreachable and the access token has expired.
+    'OIDC_RETRY_AFTER_SECONDS': (int, 5),
+    # Django cache alias used for the cross-process refresh lock. When unset, the 2.0 behaviour is kept
+    # ('redis' when DEPLOYMENT_ENVIRONMENT is set, else 'local', falling back to 'default').
+    'OIDC_REFRESH_LOCK_CACHE_ALIAS': (str, None),
 }
 
 

@@ -249,8 +249,9 @@ class TestAuthenticateView:
         fill_params_for_pkce.reset_mock()
         fill_params_without_pkce.assert_called_once()
         fill_params_without_pkce.reset_mock()
+        # with PKCE, state (login CSRF) and nonce (id token replay) are still sent
         assert view.get_auth_params(request, False, True, ['openid', 'email']) == (
-            {constants.SESSION_CHALLENGE: 'challenge'},
+            {constants.SESSION_CHALLENGE: 'challenge', constants.SESSION_STATE: 'test state', constants.SESSION_NONCE: 'test nonce'},
             {
                 'response_type': 'code',
                 'client_id': 'test client_id',
@@ -258,17 +259,19 @@ class TestAuthenticateView:
                 'redirect_uri': 'http://testserver/oidc/callback',
                 'code_challenge_method': 'S256',
                 'code_challenge': 'code challenge',
+                'state': 'test state',
+                'nonce': 'test nonce',
             },
         )
         get_claims_parameter.assert_called_once_with(request)
         get_claims_parameter.reset_mock()
         fill_params_for_pkce.assert_called_once()
         fill_params_for_pkce.reset_mock()
-        fill_params_without_pkce.assert_not_called()
+        fill_params_without_pkce.assert_called_once()
         fill_params_without_pkce.reset_mock()
         get_claims_parameter.return_value = dict(userinfo={'is_admin': None}, id_token={'group': None})
         assert view.get_auth_params(request, True, True, ['openid', 'email']) == (
-            {constants.SESSION_CHALLENGE: 'challenge'},
+            {constants.SESSION_CHALLENGE: 'challenge', constants.SESSION_STATE: 'test state', constants.SESSION_NONCE: 'test nonce'},
             {
                 'response_type': 'code',
                 'client_id': 'test client_id',
@@ -277,13 +280,15 @@ class TestAuthenticateView:
                 'claims': '{"userinfo": {"is_admin": null}, "id_token": {"group": null}}',
                 'code_challenge_method': 'S256',
                 'code_challenge': 'code challenge',
+                'state': 'test state',
+                'nonce': 'test nonce',
             },
         )
         get_claims_parameter.assert_called_once_with(request)
         get_claims_parameter.reset_mock()
         fill_params_for_pkce.assert_called_once()
         fill_params_for_pkce.reset_mock()
-        fill_params_without_pkce.assert_not_called()
+        fill_params_without_pkce.assert_called_once()
         fill_params_without_pkce.reset_mock()
 
     @patch('oauth2_authcodeflow.views.AuthenticateView.get_url_with_params')
@@ -938,3 +943,47 @@ class TestLogoutByOPView:
         response = view.get(request)
         assert response.status_code == 200
         BlacklistedToken.blacklist.assert_called_once_with('id.token')
+
+
+class TestBridgePkceStateAndNonce:
+    """2.1: with PKCE the callback is still protected by state (login CSRF) and nonce (id token replay)."""
+
+    def test_pkce_callback_validates_state_and_nonce(self, rf, sf):
+        view = CallbackView()
+        request = rf.get('/', {'code': 'c', 'state': 'good'})
+        sf(request)
+        request.session[constants.SESSION_CHALLENGE] = 'challenge'
+        request.session[constants.SESSION_STATE] = 'good'
+        request.session[constants.SESSION_NONCE] = 'nonce'
+        assert view.extract_auth_callback_params_with_pkce(request) == ('good', 'nonce', 'challenge')
+        assert constants.SESSION_STATE not in request.session
+        request = rf.get('/', {'code': 'c', 'state': 'forged'})
+        sf(request)
+        request.session[constants.SESSION_CHALLENGE] = 'challenge'
+        request.session[constants.SESSION_STATE] = 'good'
+        request.session[constants.SESSION_NONCE] = 'nonce'
+        with pytest.raises(SuspiciousOperation, match=escape("state values do not match")):
+            view.extract_auth_callback_params_with_pkce(request)
+
+    @patch('oauth2_authcodeflow.views.get_random_string')
+    def test_authenticate_with_pkce_sends_state_and_nonce(self, get_random_string, rf, sf, settings):
+        get_random_string.side_effect = lambda *args, **kwargs: 'random'
+        settings.OIDC_RP_CLIENT_ID = 'cid'
+        request = rf.get('/')
+        sf(request)
+        session_updates, auth_params = AuthenticateView().get_auth_params(request, False, True, ['openid'])
+        assert auth_params['state'] == 'random' and auth_params['nonce'] == 'random' and auth_params['code_challenge_method'] == 'S256'
+        assert session_updates[constants.SESSION_STATE] == 'random' and session_updates[constants.SESSION_NONCE] == 'random'
+        assert constants.SESSION_CHALLENGE in session_updates
+
+    @patch('oauth2_authcodeflow.views.CallbackView.logout_callback')
+    @patch('oauth2_authcodeflow.views.CallbackView.auth_callback')
+    def test_login_callback_wins_over_a_leftover_logout_state(self, auth_callback, logout_callback, rf, sf, settings):
+        settings.OIDC_RP_USE_PKCE = True
+        auth_callback.return_value = '/auth/url'
+        request = rf.get('/', {'code': 'some code', 'state': 'login state'})
+        request.user = MagicMock(is_authenticated=False)
+        sf(request)
+        request.session[constants.SESSION_LOGOUT_STATE] = 'stale logout state'
+        assert CallbackView().get_redirect_url(request, True, False, 'login state', '/next', '/fail') == '/auth/url'
+        logout_callback.assert_not_called()

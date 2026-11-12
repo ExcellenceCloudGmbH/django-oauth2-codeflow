@@ -130,6 +130,7 @@ class TestAuthenticationMixin:
             )
 
     def test_validate_and_decode_id_token_get_claims_with_secret(self, frozen_datetime, settings):
+        settings.OIDC_RP_SIGN_ALGOS_ALLOWED = ['HS256']  # symmetric algorithms must be opted in
         settings.OIDC_RP_CLIENT_ID = 'a_client_id'
         settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret_of_at_least_32_bytes'
         authentication = AuthenticationMixin()
@@ -242,6 +243,7 @@ class TestAuthenticationMixin:
         assert claims == original_claims
 
     def test_validate_and_decode_id_token_audience(self, frozen_datetime, settings):
+        settings.OIDC_RP_SIGN_ALGOS_ALLOWED = ['HS256']  # symmetric algorithms must be opted in
         settings.OIDC_RP_CLIENT_ID = 'a_client_id'
         settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret_of_at_least_32_bytes'
         authentication = AuthenticationMixin()
@@ -308,7 +310,7 @@ class TestAuthenticationMixin:
         request_get.reset_mock()
         settings.OIDC_OP_FETCH_USER_INFO = True
         user2 = authentication.get_or_create_user(request, claims, access_token)
-        request_get.assert_called_once_with('userinfo_url', headers={'Authorization': 'Bearer a_token'})
+        request_get.assert_called_once_with('userinfo_url', headers={'Authorization': 'Bearer a_token'}, timeout=10)
         request_get.reset_mock()
         assert user2
         assert user2.id == user.id
@@ -317,7 +319,17 @@ class TestAuthenticationMixin:
         assert user2.first_name == 'Cyrille'
         assert user2.last_name == 'Pontvieux'
         assert user2.is_active is True
-        assert user2.has_usable_password() is False
+        # 2.1: by default an existing user's password is never touched on login, so the session auth hash
+        # of the user's other Django sessions stays valid (signing in on a second device logs nobody out)
+        assert user2.has_usable_password() is True
+        password_hash = user2.password
+        user2b = authentication.get_or_create_user(request, claims, access_token)
+        assert user2b.password == password_hash
+        # the legacy behaviour is still available on demand
+        settings.OIDC_UNUSABLE_PASSWORD = True
+        user2c = authentication.get_or_create_user(request, claims, access_token)
+        assert user2c.has_usable_password() is False
+        request_get.reset_mock()
 
         def extend_user(user, claims, request, access_token):
             user.is_staff = claims.get('staff', 'no') == 'yes'
@@ -485,6 +497,7 @@ class TestAuthenticationBackend:
                 'code_verifier': 'verifier',
             },
             headers=None,
+            timeout=10,
         )
 
     @patch('oauth2_authcodeflow.auth.AuthenticationBackend.get_or_create_user')
@@ -529,6 +542,7 @@ class TestAuthenticationBackend:
                 'code_verifier': 'verifier',
             },
             headers=None,
+            timeout=10,
         )
         assert dict(session.items()) == {
             constants.SESSION_OP_TOKEN_URL: 'token_url',
@@ -585,6 +599,7 @@ class TestAuthenticationBackend:
                 'code_verifier': 'verifier',
             },
             headers=None,
+            timeout=10,
         )
         assert dict(session.items()) == {
             constants.SESSION_OP_TOKEN_URL: 'token_url',
@@ -641,6 +656,7 @@ class TestAuthenticationBackend:
                 'code_verifier': 'verifier',
             },
             headers=None,
+            timeout=10,
         )
         assert dict(session.items()) == {
             constants.SESSION_OP_TOKEN_URL: 'token_url',
@@ -695,6 +711,7 @@ class TestAuthenticationBackend:
                 'code_verifier': 'verifier',
             },
             headers={'origin': '/oidc/callback'},
+            timeout=10,
         )
         assert dict(session.items()) == {
             constants.SESSION_OP_TOKEN_URL: 'token_url',
@@ -746,6 +763,7 @@ class TestAuthenticationBackend:
                 'code': 'code',
             },
             headers=None,
+            timeout=10,
         )
         assert dict(session.items()) == {
             constants.SESSION_OP_TOKEN_URL: 'token_url',
@@ -794,6 +812,7 @@ class TestAuthenticationBackend:
                 'code': 'code',
             },
             headers=None,
+            timeout=10,
         )
         assert dict(session.items()) == {
             constants.SESSION_OP_TOKEN_URL: 'token_url',
@@ -855,3 +874,34 @@ class TestBearerAuthenticationBackend:
         validate_and_decode_id_token.assert_called_once_with('Token', nonce=None, jwks=self.JWKS)
         get_or_create_user.assert_called_once_with(request, {'email': 'my-email@example.com'}, '')
         is_blacklisted.assert_called_once_with('Token')
+
+
+class TestBridgeAlgorithms:
+    """2.1: asymmetric algorithms only by default; PS* and ES* keys from the JWKS are supported."""
+
+    def test_hs256_is_rejected_by_default(self, frozen_datetime, settings):
+        settings.OIDC_RP_CLIENT_ID = 'a_client_id'
+        settings.OIDC_RP_CLIENT_SECRET = 'a_client_secret_of_at_least_32_bytes'
+        exp = int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp())
+        forged = jwt.encode({'aud': 'a_client_id', 'email': 'victim@example.com', 'exp': exp}, settings.OIDC_RP_CLIENT_SECRET, algorithm='HS256')
+        with pytest.raises(SuspiciousOperation, match="The token algorithm HS256 is not allowed"):
+            AuthenticationMixin().validate_and_decode_id_token(id_token=forged, nonce=None, jwks={})
+
+    @pytest.mark.parametrize('algorithm', ['ES256', 'PS256'])
+    def test_es_and_ps_tokens_with_jwks(self, algorithm, frozen_datetime, settings):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from jwt.algorithms import (
+            ECAlgorithm,
+            RSAAlgorithm,
+        )
+        settings.OIDC_RP_CLIENT_ID = 'a_client_id'
+        if algorithm == 'ES256':
+            private_key = ec.generate_private_key(ec.SECP256R1())
+            jwk = ECAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+        else:
+            private_key = rsa.generate_private_key(65537, 2048)
+            jwk = RSAAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+        jwk.update(kid='k1', use='sig', alg=algorithm)
+        claims = {'aud': 'a_client_id', 'email': 'my-email@example.com', 'exp': int((frozen_datetime.fake_utcnow + timedelta(minutes=2)).timestamp())}
+        token = jwt.encode(claims, private_key, algorithm=algorithm, headers={'kid': 'k1'})
+        assert AuthenticationMixin().validate_and_decode_id_token(id_token=token, nonce=None, jwks={'k1': jwk}) == claims
