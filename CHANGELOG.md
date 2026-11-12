@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ### Deprecated
 - `RefreshAccessTokenMiddleware`, `RefreshSessionMiddleware`, `Oauth2MiddlewareMixin` and `MiddlewareException`.
 - `purge_blacklisted_tokens` (use `oidc_cleanup`). `BlacklistedToken` is frozen and will be dropped in 4.0.
+## 2.1.0
+### Fixed
+- A token refresh only ends the session when the provider answers `invalid_grant`. Other OAuth errors, 429/5xx, HTML pages from a proxy, timeouts and connection errors keep the session: the still valid access token is served, otherwise a 503 with `Retry-After` is answered (`{"error": "auth_unavailable", "retry_after": N}` for API/fetch requests, a self-retrying page for navigations).
+- The id token is no longer blacklisted on refresh nor checked against the blacklist on every request: concurrent requests holding the pre-refresh session no longer log the user out (the cause of the `SessionInterrupted` errors).
+- The refresh lock has an owner and is only released by it; concurrent requests use the current token while it is valid and otherwise wait (read only) for the leader instead of refreshing in parallel; an unusable lock cache falls back to a process-local lock instead of a refresh stampede. New setting `OIDC_REFRESH_LOCK_CACHE_ALIAS`.
+- `oidc_expires_at` slides on every successful refresh (idle timeout instead of a fixed lifetime).
+- Fetch/XHR/API requests get a JSON 401 (`{"error": "not_authenticated" | "session_expired", "login_url": …}`, `WWW-Authenticate`, `Cache-Control: no-store`) instead of a redirect, also for GET requests on API URLs; page navigations keep the redirect. Anonymous sessions are never flushed (a pending login survives concurrent XHRs).
+- A callback carrying an authorization code is never handled as a logout callback.
+### Changed
+- The access token is refreshed `OIDC_REFRESH_SKEW_SECONDS` (30) before it expires. New setting `OIDC_RETRY_AFTER_SECONDS` (5).
+- With PKCE, `state` and `nonce` are sent and validated too.
+- A session written by the 3.0 layout (`_oidc_session_id` without tokens) is treated as unauthenticated without being destroyed (safe rollback from 3.0).
+- `BearerAuthMiddleware` ignores `Authorization` headers using another scheme than `OIDC_AUTHORIZATION_HEADER_PREFIX`.
+- Every forced logout is logged at WARNING with its reason; tokens never appear in messages, logs or response bodies.
+### Security
+- `OIDC_RP_SIGN_ALGOS_ALLOWED` defaults to RS/PS/ES 256/384/512: HS* (keyed by the client secret) must be listed explicitly. PS* and ES* keys from the JWKS are supported.
+- `OIDC_UNUSABLE_PASSWORD` defaults to `False`: logging in no longer changes the password hash, which invalidated the user's other sessions.
+- `OIDC_TIMEOUT` defaults to 10 seconds and, like `OIDC_PROXY`, is applied to every call to the provider (discovery, JWKS, token, refresh, userinfo).
 
 ## 2.0.0
 ### Security
