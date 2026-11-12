@@ -8,7 +8,10 @@ from datetime import (
     timezone,
 )
 from logging import getLogger
-from re import search
+from re import (
+    fullmatch,
+    search,
+)
 from typing import (
     Any,
     Callable,
@@ -66,6 +69,8 @@ TOKEN_SESSION_KEYS: Tuple[str, ...] = (
 )
 #: OAuth2 errors of the token endpoint that mean the refresh token (or the OP session behind it) is gone for good.
 TERMINAL_OAUTH_ERRORS = frozenset({'invalid_grant'})
+#: Shape of an error code that may be written to the logs (RFC 6749 error codes, exception class names).
+LOGGABLE_ERROR_CODE = r'[A-Za-z][A-Za-z0-9_.-]{0,63}'
 #: Machine readable codes of the JSON 401 body.
 NOT_AUTHENTICATED = 'not_authenticated'
 SESSION_EXPIRED = 'session_expired'
@@ -107,7 +112,7 @@ class RefreshOutcome:
     """Classified answer of the token endpoint to a refresh_token grant."""
     category: str  # 'ok', 'terminal', 'config' or 'transient'
     status: Optional[int] = None
-    oauth_error: Optional[str] = None
+    error_code: Optional[str] = None  # OAuth2 ``error`` of the answer, or the exception class name
     payload: Optional[Dict[str, Any]] = None
 
 
@@ -134,6 +139,18 @@ def classify_token_response(status: int, body: Any) -> Tuple[str, Optional[str]]
     if 200 <= status < 300 and body.get('access_token'):
         return 'ok', None
     return 'transient', None
+
+
+def loggable_error_code(error_code: Optional[str]) -> str:
+    """
+    Value of an error code that is safe to log: the code itself when it looks like an OAuth2 error code
+    (or an exception class name), a fixed marker otherwise, so no free-form provider text reaches the logs.
+    """
+    if not error_code:
+        return '-'
+    if fullmatch(LOGGABLE_ERROR_CODE, error_code):
+        return error_code
+    return '<redacted>'
 
 
 class _ProcessLocks:
@@ -584,13 +601,13 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
         try:
             resp = request_post(request.session[constants.SESSION_OP_TOKEN_URL], data=params, **op_request_kwargs())
         except RequestException as e:
-            return RefreshOutcome('transient', oauth_error=e.__class__.__name__)
+            return RefreshOutcome('transient', error_code=e.__class__.__name__)
         try:
             body = resp.json()
         except ValueError:
             body = None
-        category, oauth_error = classify_token_response(resp.status_code, body)
-        return RefreshOutcome(category, status=resp.status_code, oauth_error=oauth_error, payload=body if category == 'ok' else None)
+        category, error_code = classify_token_response(resp.status_code, body)
+        return RefreshOutcome(category, status=resp.status_code, error_code=error_code, payload=body if category == 'ok' else None)
 
     def store_tokens(self, request: HttpRequest, result: Dict[str, Any], now: int) -> None:
         access_token = result["access_token"]
@@ -652,11 +669,11 @@ class RefreshAccessTokenMiddleware(Oauth2MiddlewareMixin):
                 logger.debug('access token refreshed')
                 return
             if outcome.category == 'terminal':
-                raise MiddlewareException("the OIDC provider rejected the refresh token", reason=f"refresh_{outcome.oauth_error}")
+                raise MiddlewareException("the OIDC provider rejected the refresh token", reason=f"refresh_{loggable_error_code(outcome.error_code)}")
             log = logger.error if outcome.category == 'config' else logger.warning
             log(
                 "oidc: token refresh failed (category=%s, status=%s, error=%s); the session is kept",
-                outcome.category, outcome.status, outcome.oauth_error,
+                outcome.category, outcome.status, loggable_error_code(outcome.error_code),
             )
             self._serve_or_unavailable(request, outcome.category)
         finally:

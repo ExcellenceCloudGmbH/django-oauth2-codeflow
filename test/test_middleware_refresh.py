@@ -37,6 +37,7 @@ from oauth2_authcodeflow.middleware import (
     RefreshLock,
     RefreshSessionMiddleware,
     classify_token_response,
+    loggable_error_code,
 )
 from oauth2_authcodeflow.models import BlacklistedToken
 
@@ -134,6 +135,18 @@ class TestClassification:
     ])
     def test_classify_token_response(self, status, body, expected):
         assert classify_token_response(status, body if isinstance(body, (dict, list)) else None) == expected
+
+    @pytest.mark.parametrize('error_code, expected', [
+        (None, '-'),
+        ('', '-'),
+        ('invalid_client', 'invalid_client'),
+        ('ConnectionError', 'ConnectionError'),
+        ('secret=abc def', '<redacted>'),
+        ('bad\nline', '<redacted>'),
+        ('x' * 65, '<redacted>'),
+    ])
+    def test_loggable_error_code(self, error_code, expected):
+        assert loggable_error_code(error_code) == expected
 
 
 class TestRefreshOutcomes:
