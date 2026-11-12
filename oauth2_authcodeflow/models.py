@@ -47,7 +47,7 @@ class OIDCSession(models.Model):
     (``SELECT … FOR UPDATE``), so exactly one refresh runs per sign-in, across processes.
     """
     id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
-    user = models.ForeignKey(dj_settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='oidc_sessions')
+    user: 'models.ForeignKey[Any]' = models.ForeignKey(dj_settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='oidc_sessions')
     user_id: Any  # the user model's primary key type
     django_session_key = models.CharField(max_length=40, blank=True, default='', db_index=True)
     issuer = models.CharField(max_length=512)

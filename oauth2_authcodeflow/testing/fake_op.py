@@ -267,6 +267,8 @@ class FakeOP:
                 return scripted
             if isinstance(scripted, dict):
                 return FakeResponse(200, scripted)
+            if not isinstance(scripted, tuple):
+                raise TypeError(f"unsupported scripted token response: {scripted!r}")
             status, body, *rest = scripted
             if isinstance(body, dict):
                 return FakeResponse(status, body, content_type=rest[0] if rest else 'application/json')
